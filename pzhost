@@ -8,7 +8,7 @@
 #          pzhost help       (list all commands)
 # =============================================================================
 
-PZHOST_VERSION="1.6.0"
+PZHOST_VERSION="1.6.1"
 REPO="rohansinghwow/zomboid-host"
 
 # ---- fixed paths -------------------------------------------------------------
@@ -165,14 +165,16 @@ INSTALLED_BRANCH=""
 
 load_config() { [[ -f $CONF ]] && source "$CONF"; }
 save_config() {
-  umask 077
+  # umask only inside a subshell: a leaked 077 made sudo create /usr/local/lib/pzhost
+  # as root-only, so the backup (runs as user pz) got "Permission denied".
+  ( umask 077
   {
     echo "# pzhost config — written $(date '+%F %T'). Keep private (contains passwords)."
     for v in SERVER_NAME PZ_BRANCH XMX SAVE_MINUTES JOIN_PASSWORD ADMIN_PASSWORD NETWORK_MODE \
              AUTOSTART BACKUP_KEEP_DAYS BATTERY_LIMIT PERMISSION_GRANTED INSTALLED INSTALLED_BRANCH; do
       printf '%s=%q\n' "$v" "${!v}"
     done
-  } >"$CONF"
+  } >"$CONF" )
   chmod 600 "$CONF"
 }
 
@@ -182,6 +184,19 @@ save_config() {
 SUDO_KEEPALIVE_PID=""
 cleanup() { [[ -n $SUDO_KEEPALIVE_PID ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null; }
 trap cleanup EXIT
+
+fix_lib_perms() {  # heal installs made by v1.0–1.6 (scripts folder was root-only → backups failed)
+  [[ -d $LIB_DIR ]] || return 0
+  if [[ $(stat -c %a "$LIB_DIR" 2>/dev/null) != 755 ]] || ! sudo -u "$PZ_USER" test -x "${LIB_DIR}/pz-backup.sh" 2>/dev/null; then
+    sudo chmod 755 "$LIB_DIR" && sudo find "$LIB_DIR" -maxdepth 1 -name '*.sh' -exec chmod 755 {} + \
+      && log INFO "fixed permissions of $LIB_DIR"
+  fi
+  local f
+  for f in /usr/share/keyrings/tailscale-archive-keyring.gpg /etc/apt/sources.list.d/tailscale.list; do
+    [[ -f $f && $(stat -c %a "$f" 2>/dev/null) != 644 ]] && sudo chmod 644 "$f"   # apt reads these as user _apt
+  done
+  return 0
+}
 
 sudo_start() {
   [[ -n $SUDO_KEEPALIVE_PID ]] && sudo -n true 2>/dev/null && return 0
@@ -196,6 +211,7 @@ sudo_start() {
   fi
   ( exec 9>&-; while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) &  # 9 = busy lock
   SUDO_KEEPALIVE_PID=$!
+  fix_lib_perms
 }
 
 show_permission_screen() {
@@ -401,6 +417,7 @@ add_tailscale_repo() {  # Debian/Ubuntu: Tailscale is not in the distro repos
   fi
   curl -fsSL "${base}.noarmor.gpg" | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null || return 1
   curl -fsSL "${base}.tailscale-keyring.list" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null || return 1
+  sudo chmod 644 /usr/share/keyrings/tailscale-archive-keyring.gpg /etc/apt/sources.list.d/tailscale.list
   log INFO "tailscale repo: ${base}"
 }
 
@@ -539,7 +556,7 @@ write_if_changed() {  # write_if_changed FILE < content — server restart only 
 }
 
 write_units() {
-  sudo mkdir -p "$LIB_DIR"
+  sudo mkdir -p "$LIB_DIR"; sudo chmod 755 "$LIB_DIR"
 
   sudo tee "${LIB_DIR}/pz-backup.sh" >/dev/null <<'EOF'
 #!/usr/bin/env bash
@@ -1419,7 +1436,7 @@ ${note:+  $note
 EOF
 )
   echo; echo "$card"; echo "  Server right now: ${state}"
-  umask 077; printf '%s\n' "$card" >"$JOIN_CARD"
+  ( umask 077; printf '%s\n' "$card" >"$JOIN_CARD" )
   echo "${D}Saved to ${JOIN_CARD} — send it to your friends privately (it has the password).${N}"
   if command -v wl-copy >/dev/null && [[ -n ${WAYLAND_DISPLAY:-} ]]; then
     printf '%s\n' "$card" | wl-copy && echo "${D}Also copied to clipboard.${N}"
