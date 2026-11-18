@@ -110,6 +110,6 @@ pzhost settings|update-server|report|self-update|uninstall
 
 ## Other guides
 
-- [`docs/CACHYOS_LAPTOP_MANUAL.md`](docs/CACHYOS_LAPTOP_MANUAL.md) — manual setup (written for CachyOS; the app now targets Debian)
+- [`docs/DEBIAN_LAPTOP_MANUAL.md`](docs/DEBIAN_LAPTOP_MANUAL.md) — the same setup done by hand on Debian 13
 - [`docs/LINUX_VPS.md`](docs/LINUX_VPS.md) — Ubuntu VPS (DigitalOcean)
 - [`docs/WINDOWS_VPS.md`](docs/WINDOWS_VPS.md) — Windows VPS

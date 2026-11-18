@@ -1,6 +1,6 @@
-# Project Zomboid Server — Home Laptop (CachyOS) behind a Jio router
+# Project Zomboid Server — Home Laptop (Debian 13) behind a Jio router
 
-Host: 4-core i7 11th gen laptop, 512 GB SSD, CachyOS. Players: 4 friends (2 Windows, 2 Mac).
+Host: 4-core i7 11th gen laptop, 512 GB SSD, 16 GB RAM, Debian 13 (trixie). Players: 4 friends (2 Windows, 2 Mac).
 Build 42.21, `-nosteam` mode so GOG copies can join.
 
 ---
@@ -49,11 +49,11 @@ Also: keep it **plugged in**, on a hard surface (cooling), and if possible use a
 
 ### Packages
 
-CachyOS has the multilib repo enabled by default.
+If `sudo` says you're not in the sudoers file: `su -` → `apt install -y sudo && usermod -aG sudo YOUR_USERNAME` → `exit`, then log out/in.
 
 ```bash
-sudo pacman -Syu
-sudo pacman -S --needed lib32-gcc-libs curl tar ufw tmux
+sudo apt update && sudo apt full-upgrade -y
+sudo apt install -y lib32gcc-s1 curl tar ca-certificates ufw tmux
 
 # Dedicated user — don't run the server as your normal account or root
 sudo useradd -m -s /bin/bash pz
@@ -201,7 +201,10 @@ sudo ufw status
 On the laptop:
 
 ```bash
-sudo pacman -S tailscale
+# Tailscale is not in Debian's repos — add its official apt repo (trixie)
+curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+curl -fsSL https://pkgs.tailscale.com/stable/debian/trixie.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+sudo apt update && sudo apt install -y tailscale
 sudo systemctl enable --now tailscaled
 sudo tailscale up            # opens a login link
 tailscale ip -4              # your server IP, looks like 100.x.y.z
@@ -233,7 +236,7 @@ Nothing on the Jio router needs to change, and the server isn't visible to the p
 
 ## 5C. playit.gg — fallback
 
-Install `playit` (AUR: `paru -S playit-bin`), run it, claim the agent via the printed link,
+Install `playit` (Debian package from https://playit.gg/download), run it, claim the agent via the printed link,
 and create a **UDP** tunnel to local port `16261` (and one for `16262`).
 Friends connect to the address/port playit gives you. Because playit assigns its own public ports,
 PZ may fail to connect if the two ports don't line up; use Tailscale if that happens.
@@ -248,7 +251,7 @@ As root (`sudo crontab -e`):
 0 5 * * * echo save > /home/pz/pzserver.control && sleep 30 && mkdir -p /home/pz/backups && tar czf /home/pz/backups/pz-$(date +\%F).tar.gz -C /home/pz Zomboid/Saves/Multiplayer Zomboid/Server Zomboid/db && find /home/pz/backups -name 'pz-*.tar.gz' -mtime +7 -delete
 ```
 
-CachyOS may not ship a cron daemon. If `crontab` is missing: `sudo pacman -S cronie && sudo systemctl enable --now cronie`.
+If `crontab` is missing: `sudo apt install -y cron && sudo systemctl enable --now cron`.
 
 ---
 
