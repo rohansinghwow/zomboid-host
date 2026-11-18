@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  pzhost — Project Zomboid dedicated server manager for CachyOS / Arch Linux
+#  pzhost — Project Zomboid dedicated server manager for Debian 13 (also Ubuntu / Arch)
 #  One app that installs, runs, backs up and troubleshoots a private
 #  Build 42 server for a small group of friends (Windows + Mac clients).
 #
@@ -8,7 +8,7 @@
 #          pzhost help       (list all commands)
 # =============================================================================
 
-PZHOST_VERSION="1.0.1"
+PZHOST_VERSION="1.1.0"
 REPO="rohansinghwow/zomboid-host"
 
 # ---- fixed paths -------------------------------------------------------------
@@ -38,6 +38,15 @@ JOIN_CARD="${HOME}/ZOMBOID_JOIN_INFO.txt"
 
 set -o pipefail
 set -E
+# Debian keeps ufw, sysctl, iw, useradd in sbin, which is not in a normal user's PATH.
+export PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
+
+# ---- distro detection -------------------------------------------------------
+OS_ID=$(. /etc/os-release 2>/dev/null && echo "${ID:-} ${ID_LIKE:-}")
+OS_CODENAME=$(. /etc/os-release 2>/dev/null && echo "${VERSION_CODENAME:-}")
+if command -v apt-get >/dev/null 2>&1; then PKG=apt
+elif command -v pacman >/dev/null 2>&1; then PKG=pacman
+else PKG=unknown; fi
 
 # ---- colours -----------------------------------------------------------------
 if [[ -t 1 ]]; then
@@ -145,8 +154,15 @@ trap cleanup EXIT
 
 sudo_start() {
   [[ -n $SUDO_KEEPALIVE_PID ]] && sudo -n true 2>/dev/null && return 0
+  if ! command -v sudo >/dev/null; then
+    err "sudo is not installed. As root run:  su -   then:  apt install sudo && usermod -aG sudo $(id -un)   then log out and back in."
+    return 1
+  fi
   echo "${D}Your password is needed once for this session (sudo).${N}"
-  sudo -v || { err "sudo password was not accepted."; return 1; }
+  if ! sudo -v; then
+    err "sudo failed. If you see \"not in the sudoers file\": run  su -  then  usermod -aG sudo $(id -un)  and log out/in."
+    return 1
+  fi
   ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) &
   SUDO_KEEPALIVE_PID=$!
 }
@@ -157,9 +173,9 @@ show_permission_screen() {
 ${W}════════════════════ Permission needed ════════════════════${N}
 To host the Zomboid server, this app will make these changes:
 
- ${W}Install packages${N} (pacman): lib32-gcc-libs curl tar git github-cli
-                              + tailscale (if you choose Tailscale)
-                              (may run a full system update if pacman asks)
+ ${W}Install packages${N} (${PKG}): $(pkg_list | tr '\n' ' ')
+                   + tailscale (if chosen; on Debian/Ubuntu this adds
+                     Tailscale's official apt repository)
  ${W}Create a system user${N} "${PZ_USER}" (home ${PZ_HOME}) that runs the server
  ${W}Download${N} SteamCMD + Project Zomboid server (~5 GB) into ${PZ_HOME}
  ${W}Create services${N}: pzserver (server), pzbackup (daily 05:00),
@@ -265,8 +281,9 @@ setup_questions() {
 preflight() {
   local id_like; id_like=$(. /etc/os-release && echo "${ID} ${ID_LIKE:-}")
   info "OS: $(. /etc/os-release && echo "$PRETTY_NAME"), kernel $(uname -r)"
-  [[ $id_like == *arch* || $id_like == *cachyos* ]] || { err "This app supports CachyOS / Arch Linux only."; return 1; }
-  command -v pacman >/dev/null || { err "pacman not found."; return 1; }
+  [[ $id_like == *debian* || $id_like == *ubuntu* || $id_like == *arch* ]] \
+    || { err "This app supports Debian 13 / Ubuntu / Arch Linux."; return 1; }
+  [[ $PKG != unknown ]] || { err "Neither apt nor pacman found."; return 1; }
   command -v systemctl >/dev/null || { err "systemd not found."; return 1; }
   [[ $(uname -m) == x86_64 ]] || { err "x86_64 CPU required (found $(uname -m))."; return 1; }
 
@@ -289,18 +306,56 @@ preflight() {
   ok "Internet OK"
 }
 
-install_packages() {
-  local pkgs=(lib32-gcc-libs curl tar git github-cli)
-  [[ $NETWORK_MODE == tailscale ]] && pkgs+=(tailscale)
-  local missing=() p
-  for p in "${pkgs[@]}"; do pacman -Qi "$p" >/dev/null 2>&1 || missing+=("$p"); done
-  if (( ${#missing[@]} == 0 )); then ok "All packages already installed"; return 0; fi
-  info "Installing: ${missing[*]}"
-  if ! run sudo pacman -S --needed --noconfirm "${missing[@]}"; then
-    warn "Install failed — package database may be out of date. Running a full system update and retrying…"
-    run sudo pacman -Syu --noconfirm || return 1
-    run sudo pacman -S --needed --noconfirm "${missing[@]}" || return 1
+pkg_list() {  # base packages for this distro
+  if [[ $PKG == apt ]]; then
+    printf '%s\n' lib32gcc-s1 curl tar ca-certificates git gh iputils-ping iproute2 procps iw
+  else
+    printf '%s\n' lib32-gcc-libs curl tar git github-cli iputils iproute2 procps-ng iw
   fi
+}
+
+pkg_installed() {
+  if [[ $PKG == apt ]]; then dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+  else pacman -Qi "$1" >/dev/null 2>&1; fi
+}
+
+pkg_install() {  # pkg_install PKG...
+  if [[ $PKG == apt ]]; then
+    run sudo apt-get update || return 1
+    run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+  else
+    run sudo pacman -S --needed --noconfirm "$@" && return 0
+    warn "Install failed — package database may be out of date. Running a full system update and retrying…"
+    run sudo pacman -Syu --noconfirm && run sudo pacman -S --needed --noconfirm "$@"
+  fi
+}
+
+add_tailscale_repo() {  # Debian/Ubuntu: Tailscale is not in the distro repos
+  [[ -f /etc/apt/sources.list.d/tailscale.list ]] && return 0
+  local distro=debian code=${OS_CODENAME:-trixie}
+  [[ $OS_ID == ubuntu* || $OS_ID == *" ubuntu"* ]] && distro=ubuntu
+  local base="https://pkgs.tailscale.com/stable/${distro}/${code}"
+  info "Adding Tailscale apt repository (${distro} ${code})…"
+  if ! curl -fsSL "${base}.noarmor.gpg" -o /dev/null; then
+    warn "Tailscale has no repo for '${code}' — falling back to Debian bookworm packages."
+    distro=debian; code=bookworm; base="https://pkgs.tailscale.com/stable/${distro}/${code}"
+  fi
+  curl -fsSL "${base}.noarmor.gpg" | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null || return 1
+  curl -fsSL "${base}.tailscale-keyring.list" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null || return 1
+  log INFO "tailscale repo: ${base}"
+}
+
+install_packages() {
+  local pkgs=() missing=() p
+  mapfile -t pkgs < <(pkg_list)
+  [[ $NETWORK_MODE == tailscale ]] && pkgs+=(tailscale)
+  for p in "${pkgs[@]}"; do pkg_installed "$p" || missing+=("$p"); done
+  if (( ${#missing[@]} == 0 )); then ok "All packages already installed"; return 0; fi
+  if [[ $PKG == apt && " ${missing[*]} " == *" tailscale "* ]]; then
+    add_tailscale_repo || { err "Could not add the Tailscale repository."; return 1; }
+  fi
+  info "Installing: ${missing[*]}"
+  pkg_install "${missing[@]}"
 }
 
 create_user() {
@@ -631,7 +686,7 @@ cmd_pingcheck() {
   local w gw r avg jit loss
   w=$(wifi_iface); gw=$(gateway_ip)
   if [[ -n $w ]]; then
-    local line; line=$(nmcli -t -f IN-USE,SSID,SIGNAL,FREQ dev wifi 2>/dev/null | grep '^\*' | head -1)
+    local line; command -v nmcli >/dev/null && line=$(nmcli -t -f IN-USE,SSID,SIGNAL,FREQ dev wifi 2>/dev/null | grep '^\*' | head -1)
     local sig freq; sig=$(cut -d: -f3 <<<"$line"); freq=$(cut -d: -f4 <<<"$line" | tr -dc '0-9')
     echo "  Connection : ${Y}Wi-Fi${N} (${w}) · signal ${sig:-?}% · $( [[ ${freq:-0} -ge 4900 ]] && echo 5 GHz || echo "${Y}2.4 GHz${N}")"
     [[ ${freq:-0} -lt 4900 ]] && warn "Use the Jio router's 5 GHz network (or Ethernet) — 2.4 GHz is slower and noisier."
@@ -1217,7 +1272,7 @@ EOF
 
 usage() {
   cat <<EOF
-pzhost ${PZHOST_VERSION} — Project Zomboid server manager for CachyOS
+pzhost ${PZHOST_VERSION} — Project Zomboid server manager for Debian 13 / Ubuntu / Arch
 
   pzhost                 interactive menu
   pzhost setup           install / repair everything (asks permission first)

@@ -1,6 +1,6 @@
-# 🧟 Zomboid Host — Project Zomboid server app for CachyOS
+# 🧟 Zomboid Host — Project Zomboid server app for Debian 13
 
-One app that turns a CachyOS (Arch) laptop into a private **Project Zomboid Build 42** server
+One app that turns a **Debian 13** laptop (Ubuntu and Arch also work) into a private **Project Zomboid Build 42** server
 for 4 friends (Windows + Mac), even behind a **Jio router with CGNAT**.
 
 It asks permission once, then does everything: installs the server, keeps the laptop awake,
@@ -10,19 +10,22 @@ If anything fails it can send a detailed, password-free error report to GitHub s
 
 ---
 
-## For the host (the CachyOS laptop)
+## For the host (the Debian laptop)
 
 ### 1. Install (one time)
 
-Open a terminal (Konsole) and run:
+Open a terminal and run:
 
 ```bash
-sudo pacman -S --needed git
+sudo apt update && sudo apt install -y git
 git clone https://github.com/rohansinghwow/zomboid-host.git ~/zomboid-host
 cd ~/zomboid-host
 ./install.sh
 ```
 
+> **"user is not in the sudoers file"?** Debian does this if you set a root password during install. Fix once:
+> `su -` → `apt install -y sudo && usermod -aG sudo YOUR_USERNAME` → `exit`, then log out and back in.
+>
 > To send error reports you need a free GitHub account; the app asks you to log in
 > (`gh auth login`) the first time you send one.
 
@@ -70,7 +73,7 @@ The host sends you the join info. In short:
 
 | Change | Why | Undo |
 |---|---|---|
-| Packages: `lib32-gcc-libs curl tar git github-cli tailscale` | SteamCMD, reports, networking | pacman |
+| Packages: `lib32gcc-s1 curl tar git gh iputils-ping iw tailscale` (+ Tailscale apt repo) | SteamCMD, reports, networking | apt |
 | System user `pz` (`/home/pz`) | runs the server safely | uninstall |
 | `pzserver.service` + `.socket` | runs server, clean save on stop, console commands | uninstall |
 | `pzbackup.timer` (05:00), `pzrestart.timer` (05:10) | daily backup (7 days kept), daily restart | uninstall |
@@ -107,6 +110,6 @@ pzhost settings|update-server|report|self-update|uninstall
 
 ## Other guides
 
-- [`docs/CACHYOS_LAPTOP_MANUAL.md`](docs/CACHYOS_LAPTOP_MANUAL.md) — the same setup done by hand
+- [`docs/CACHYOS_LAPTOP_MANUAL.md`](docs/CACHYOS_LAPTOP_MANUAL.md) — manual setup (written for CachyOS; the app now targets Debian)
 - [`docs/LINUX_VPS.md`](docs/LINUX_VPS.md) — Ubuntu VPS (DigitalOcean)
 - [`docs/WINDOWS_VPS.md`](docs/WINDOWS_VPS.md) — Windows VPS
