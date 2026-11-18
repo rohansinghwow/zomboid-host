@@ -849,7 +849,7 @@ class MorePage(Adw.Bin):
                      lambda: app.run_task("Network check", ["netcheck"]))
         self._action(h, "Server log", "The last messages from the game server", "Show", self.show_log)
         self._action(h, "Check for a game server update",
-                     "Downloads only if Steam has a newer build — friends must update their game too",
+                     "Never automatic. GOG players: only update when your GOG game has the same new version",
                      "Check", self.check_update)
         self._action(h, "Repair", "Fixes only what is missing or wrong. Keeps your world, settings and the "
                                   "downloaded server — the server keeps running if nothing needs a restart",
@@ -946,10 +946,13 @@ class MorePage(Adw.Bin):
         def done(rc, out):
             if rc == 0 and parse_kv(out).get("update") == "yes":
                 running = self.app.status.get("running") == "yes"
-                self.app.confirm("Update the game server now?",
-                                 ("The server stops, updates and starts again (a few minutes). " if running else "")
-                                 + "All friends must update their game to the same version.",
-                                 "Update", lambda: self.app.run_task("Updating the game server", ["update-server"]))
+                self.app.confirm("Steam has a newer server — update?",
+                                 "GOG players: GOG often gets new versions later than Steam. Only update when "
+                                 "everyone's GOG game shows the same new version in its main menu — otherwise "
+                                 "nobody can join until GOG catches up. "
+                                 + ("The server stops, updates and starts again (a few minutes)." if running else ""),
+                                 "Update anyway", lambda: self.app.run_task("Updating the game server", ["update-server"]),
+                                 destructive=True)
         self.app.run_task("Checking for a game server update", ["update-server", "--check"], on_done=done)
 
     def show_log(self):

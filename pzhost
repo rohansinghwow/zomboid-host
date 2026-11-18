@@ -1946,6 +1946,9 @@ cmd_update_server() {  # [--check] — download only if Steam has a newer build 
     echo "update=yes"; return 0
   fi
   warn "All friends must have the same game version (${PZ_BRANCH}) to join."
+  warn "GOG players: GOG often gets new versions later than Steam. Only update when everyone's GOG game"
+  warn "shows the same new version in its main menu — otherwise nobody can join until GOG catches up."
+  if [[ -t 0 ]] && ! ask_yn "Update the server now?" n; then info "Not updated."; return 0; fi
   local was=no; server_active && was=yes
   NEED_RESTART=no
   step "Update server files" install_server update && step "Re-apply memory setting" set_xmx || { on_fail; return 1; }
