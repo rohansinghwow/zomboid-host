@@ -8,7 +8,7 @@
 #          pzhost help       (list all commands)
 # =============================================================================
 
-PZHOST_VERSION="1.5.0"
+PZHOST_VERSION="1.6.0"
 REPO="rohansinghwow/zomboid-host"
 
 # ---- fixed paths -------------------------------------------------------------
@@ -35,6 +35,7 @@ CONF="${CONF_DIR}/config"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pzhost"
 LOG_FILE="${STATE_DIR}/pzhost.log"
 JOIN_CARD="${HOME}/ZOMBOID_JOIN_INFO.txt"
+LOCK_FILE="${STATE_DIR}/busy.lock"
 
 set -o pipefail
 set -E
@@ -100,6 +101,28 @@ step() {
 }
 
 pause() { [[ -t 0 ]] && read -r -p "${D}Press Enter to continue…${N}" _; }
+
+# One task at a time: the window app and the terminal menu must never run
+# setup / update / start / stop at the same moment.
+acquire_lock() {  # acquire_lock "what"
+  command -v flock >/dev/null || return 0
+  exec 9>>"$LOCK_FILE"
+  if ! flock -n 9; then
+    err "Zomboid Host is already busy with: $(cat "${LOCK_FILE}.info" 2>/dev/null || echo 'another task') (in another window or terminal). Wait until it has finished, then try again."
+    exec 9>&-; return 1
+  fi
+  echo "$1" >"${LOCK_FILE}.info"
+}
+release_lock() {
+  command -v flock >/dev/null || return 0
+  flock -u 9 2>/dev/null; exec 9>&- 2>/dev/null
+  return 0
+}
+busy_with() {  # prints what another pzhost is doing, if anything
+  command -v flock >/dev/null && [[ -f $LOCK_FILE ]] || return 1
+  flock -n "$LOCK_FILE" true 2>/dev/null && return 1
+  cat "${LOCK_FILE}.info" 2>/dev/null || echo "a task"
+}
 
 # =============================================================================
 #  Prompts
@@ -171,7 +194,7 @@ sudo_start() {
     err "sudo failed. If you see \"not in the sudoers file\": run  su -  then  usermod -aG sudo $(id -un)  and log out/in."
     return 1
   fi
-  ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) &
+  ( exec 9>&-; while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) &  # 9 = busy lock
   SUDO_KEEPALIVE_PID=$!
 }
 
@@ -247,8 +270,10 @@ send_console() {  # send a console command to the running server
   printf '%s\n' "$1" | sudo tee "$CONTROL" >/dev/null && log INFO "console ← $1"
 }
 
-set_ini() {  # set_ini KEY VALUE — replace in place or append
-  local f="${ZOMBOID_DIR}/Server/${SERVER_NAME}.ini" k=$1 v=$2
+set_ini() {  # set_ini KEY VALUE — replace in place or append (only writes when different)
+  local f="${ZOMBOID_DIR}/Server/${SERVER_NAME}.ini" k=$1 v=$2 cur
+  cur=$(as_pz grep -m1 "^${k}=" "$f" 2>/dev/null) && [[ ${cur#*=} == "$v" ]] && return 0
+  INI_CHANGED=yes
   if as_pz grep -q "^${k}=" "$f"; then
     as_pz sed -i "s|^${k}=.*|${k}=${v}|" "$f"
   else
@@ -329,6 +354,10 @@ preflight() {
     grep -q 1 /sys/class/power_supply/A{C,DP}*/online 2>/dev/null || warn "Laptop is on battery — plug in the charger for hosting."
   fi
 
+  if server_files_current; then
+    ok "Server files already installed — nothing to download"
+    return 0
+  fi
   info "Checking internet / Steam CDN…"
   curl -fsS --max-time 15 -r 0-99 -o /dev/null \
     https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz \
@@ -407,19 +436,74 @@ show_branches() {
     | head -40
 }
 
-install_server() {  # install_server [force]
-  if [[ $1 != force ]] && as_pz test -x "${SERVER_DIR}/start-server.sh" && [[ $INSTALLED_BRANCH == "$PZ_BRANCH" ]]; then
-    ok "Server files already installed (version ${PZ_BRANCH})"; return 0
+# ---- what is installed? (read from Steam's own manifest, not just our config)
+server_manifest() { as_pz cat "${SERVER_DIR}/steamapps/appmanifest_${APP_ID}.acf" 2>/dev/null; }
+installed_build() { server_manifest | awk -F'"' 'tolower($2)=="buildid" {print $4; exit}'; }
+installed_branch() {
+  local m b; m=$(server_manifest) || return 1
+  [[ -n $m ]] || return 1
+  b=$(awk -F'"' 'tolower($2)=="betakey" {print $4; exit}' <<<"$m")
+  echo "${b:-public}"
+}
+server_files_ok() { id -u "$PZ_USER" >/dev/null 2>&1 && as_pz test -x "${SERVER_DIR}/start-server.sh" && as_pz test -f "${SERVER_DIR}/ProjectZomboid64.json"; }
+server_files_current() {  # installed files are the wanted version → no download needed
+  server_files_ok || return 1
+  local have; have=$(installed_branch) || have=""
+  if [[ -n $have ]]; then [[ $have == "${PZ_BRANCH:-public}" ]]
+  else [[ $INSTALLED_BRANCH == "$PZ_BRANCH" ]]; fi
+}
+steam_latest_build() {  # newest build id of a branch, asked from Steam
+  as_pz "${STEAMCMD_DIR}/steamcmd.sh" +login anonymous +app_info_update 1 +app_info_print "$APP_ID" +quit 2>/dev/null \
+    | awk -F'"' -v br="${1:-public}" '$2=="branches"{inb=1} inb && $2==br && NF<=3 {f=1} f && $2=="buildid" {print $4; exit}'
+}
+
+# PZ servers that were NOT started by this app (by hand, or the game's own "Host"
+# button) hold the ports, so ours can't start. Stop them first.
+stop_stray_servers() {
+  command -v pgrep >/dev/null || return 0
+  local p stray=()
+  for p in $(pgrep -f 'zombie\.network\.GameServer|ProjectZomboid64.*-servername' 2>/dev/null); do
+    grep -qs 'pzserver\.service' "/proc/$p/cgroup" && continue
+    stray+=("$p")
+  done
+  (( ${#stray[@]} )) || return 0
+  warn "Another Zomboid server is already running outside this app (PID ${stray[*]}) — stopping it so the ports are free."
+  sudo kill -TERM "${stray[@]}" 2>/dev/null
+  local i
+  for i in $(seq 1 30); do
+    sleep 1
+    for p in "${stray[@]}"; do [[ -d /proc/$p ]] && continue 2; done
+    ok "Old server stopped"; return 0
+  done
+  sudo kill -KILL "${stray[@]}" 2>/dev/null
+  ok "Old server stopped (forced)"
+}
+
+install_server() {  # install_server [repair|update] — downloads only when needed
+  local mode=${1:-}
+  if [[ -z $mode ]] && server_files_current; then
+    INSTALLED_BRANCH="$PZ_BRANCH"; save_config
+    ok "Server files already installed (version ${PZ_BRANCH}, build $(installed_build || echo '?')) — no download needed"
+    return 0
   fi
-  local beta=() out attempt
+  if server_active; then
+    warn "The server is running — stopping it first so its files can be replaced."
+    send_console 'servermsg "Server is stopping for an update. Back in a few minutes."' 2>/dev/null; sleep 5
+    info "Saving world and stopping (about 20 seconds)…"
+    run sudo systemctl stop pzserver.service || return 1
+  fi
+  stop_stray_servers
+  local beta=() out attempt validate=()
   [[ -n $PZ_BRANCH && $PZ_BRANCH != public ]] && beta=(-beta "$PZ_BRANCH")
+  # Full file check only for a first install or an explicit repair (it re-reads all ~5 GB).
+  if [[ $mode == repair ]] || ! server_files_ok; then validate=(validate); fi
   out=$(mktemp)
   for attempt in 1 2 3; do
     info "Downloading server (version ${PZ_BRANCH}), attempt ${attempt}/3 — this can take a while…"
     as_pz "${STEAMCMD_DIR}/steamcmd.sh" +force_install_dir "$SERVER_DIR" +login anonymous \
-      +app_update "$APP_ID" "${beta[@]}" validate +quit 2>&1 | tee -a "$LOG_FILE" "$out"
+      +app_update "$APP_ID" "${beta[@]}" "${validate[@]}" +quit 2>&1 | tee -a "$LOG_FILE" "$out"
     if grep -q "Success! App '${APP_ID}'" "$out"; then
-      INSTALLED_BRANCH="$PZ_BRANCH"; save_config; rm -f "$out"; return 0
+      INSTALLED_BRANCH="$PZ_BRANCH"; save_config; rm -f "$out"; NEED_RESTART=yes; return 0
     fi
     if grep -qiE "invalid beta|beta.*(not found|doesn't exist)|Invalid platform" "$out"; then
       err "Steam says version/branch '${PZ_BRANCH}' does not exist."
@@ -437,9 +521,21 @@ install_server() {  # install_server [force]
 set_xmx() {
   local f="${SERVER_DIR}/ProjectZomboid64.json"
   as_pz test -f "$f" || { err "Missing $f"; return 1; }
+  if as_pz grep -q "\"-Xmx${XMX}\"" "$f"; then ok "Server memory already ${XMX}"; return 0; fi
+  NEED_RESTART=yes
   as_pz sed -E -i "s/\"-Xmx[0-9]+[gGmM]\"/\"-Xmx${XMX}\"/" "$f" || return 1
   as_pz grep -q "\"-Xmx${XMX}\"" "$f" || { err "Could not set -Xmx in $f"; return 1; }
   ok "Server memory set to ${XMX}"
+}
+
+write_if_changed() {  # write_if_changed FILE < content — server restart only if the service really changed
+  local tmp; tmp=$(mktemp)
+  cat >"$tmp"
+  if sudo cmp -s "$tmp" "$1"; then rm -f "$tmp"; return 0; fi
+  sudo install -m 644 "$tmp" "$1"; rm -f "$tmp"
+  [[ $1 == *pzserver* ]] && NEED_RESTART=yes
+  log INFO "updated $1"
+  return 0
 }
 
 write_units() {
@@ -482,7 +578,7 @@ EOF
     PPD_LINES=$'ExecStartPre=-+/usr/bin/powerprofilesctl set performance\nExecStopPost=-+/usr/bin/powerprofilesctl set balanced'
   fi
 
-  sudo tee "${UNIT_DIR}/pzserver.socket" >/dev/null <<EOF
+  write_if_changed "${UNIT_DIR}/pzserver.socket" <<EOF
 [Unit]
 Description=Project Zomboid server console (FIFO)
 BindsTo=pzserver.service
@@ -495,7 +591,7 @@ SocketMode=0660
 SocketUser=${PZ_USER}
 EOF
 
-  sudo tee "${UNIT_DIR}/pzserver.service" >/dev/null <<EOF
+  write_if_changed "${UNIT_DIR}/pzserver.service" <<EOF
 [Unit]
 Description=Project Zomboid dedicated server (managed by pzhost)
 After=network-online.target
@@ -620,16 +716,24 @@ EOF
 }
 
 configure_ini() {
-  set_ini Public false
+  INI_CHANGED=no
+  # Always managed by the app (you change these in the app):
   set_ini Password "$JOIN_PASSWORD"
-  set_ini MaxPlayers 8
   set_ini DefaultPort "$GAME_PORT"
   set_ini UDPPort "$UDP_PORT"
   set_ini SaveWorldEveryMinutes "$SAVE_MINUTES"
-  set_ini BackupsCount 5
-  set_ini BackupsOnStart true
-  set_ini BackupsOnVersionChange true
-  set_ini BackupsPeriod 60
+  # Safe defaults only the first time — after that your own changes
+  # (max players, public, backups, PvP, mods…) are kept.
+  if [[ $INSTALLED != yes ]]; then
+    set_ini Public false
+    set_ini MaxPlayers 8
+    set_ini BackupsCount 5
+    set_ini BackupsOnStart true
+    set_ini BackupsOnVersionChange true
+    set_ini BackupsPeriod 60
+  fi
+  if [[ $INI_CHANGED == yes ]]; then NEED_RESTART=yes; ok "Server settings updated"
+  else ok "Server settings already correct — your other settings are kept"; fi
 }
 
 no_sleep() {
@@ -899,6 +1003,8 @@ cmd_gui_status() {  # one-shot status for the GUI (key=value, no sudo)
   echo "port=${GAME_PORT}"
   echo "join_password=${JOIN_PASSWORD}"
   echo "ram_gb=$(total_ram_gb)"
+  [[ -n $ADMIN_PASSWORD ]] && echo "admin_set=yes" || echo "admin_set=no"
+  echo "busy=$(busy_with)"
   if battery_present; then
     echo "battery=$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -1)"
     if on_ac; then echo "ac=yes"; else echo "ac=no"; fi
@@ -1157,13 +1263,17 @@ cmd_setup() {
   fi
   log INFO "setup: branch=${PZ_BRANCH} xmx=${XMX} save=${SAVE_MINUTES} net=${NETWORK_MODE} autostart=${AUTOSTART}"
   local was_running=no; server_active && was_running=yes
+  NEED_RESTART=no
+  if [[ $INSTALLED == yes ]]; then
+    info "Repair keeps your settings: version ${PZ_BRANCH} · memory ${XMX} · auto-save ${SAVE_MINUTES} min · ${NETWORK_MODE} · start on boot ${AUTOSTART}"
+    info "Your world, gameplay settings and other server settings are not touched. Only what is missing or wrong is fixed."
+  fi
 
   step "Check system"                     preflight         &&
   step "Install packages"                 install_packages  &&
   step "Create server user '${PZ_USER}'"  create_user       &&
   step "Install SteamCMD"                 install_steamcmd  &&
-  { [[ $was_running == no ]] || sudo systemctl stop pzserver.service; } &&
-  step "Download Project Zomboid server"  install_server    &&
+  step "Project Zomboid server files"     install_server ${PZHOST_VALIDATE:+repair} &&
   step "Set server memory"                set_xmx           &&
   step "Create services and backups"      write_units       &&
   step "Create world + admin account"     first_run         &&
@@ -1176,7 +1286,16 @@ cmd_setup() {
 
   INSTALLED=yes; save_config
   echo; ok "${W}Setup complete!${N}"
-  if [[ $was_running == yes ]] || ask_yn "Start the server now?" y; then cmd_start; else cmd_join; fi
+  if server_active; then
+    if [[ $NEED_RESTART == yes ]]; then
+      info "Restarting the server so the changes are used…"
+      send_console 'servermsg "Server restarts in 10 seconds for an update"' 2>/dev/null; sleep 10
+      cmd_restart
+    else
+      ok "Server kept running — nothing needed a restart."; cmd_join
+    fi
+  elif [[ $was_running == yes ]] || ask_yn "Start the server now?" y; then cmd_start
+  else cmd_join; fi
 }
 
 # =============================================================================
@@ -1185,6 +1304,7 @@ cmd_setup() {
 cmd_start() {
   require_installed || return 1; sudo_start || return 1
   if server_active; then ok "Server is already running."; cmd_join; return 0; fi
+  stop_stray_servers
   local ts; ts=$(date +%s)
   info "Starting server…"
   run sudo systemctl start pzserver.service || { LAST_ERROR="Start server"; on_fail; return 1; }
@@ -1807,14 +1927,31 @@ EOF
   done
 }
 
-cmd_update_server() {
+cmd_update_server() {  # [--check] — download only if Steam has a newer build (or another version was chosen)
+  local check=no; [[ ${1:-} == --check ]] && check=yes
   require_installed || return 1; ensure_permission || return 1
-  warn "All 4 friends must switch to the same game version (${PZ_BRANCH}) too."
+  install_steamcmd || return 1
+  local have latest build
+  have=$(installed_branch) || have=$INSTALLED_BRANCH
+  build=$(installed_build)
+  info "Installed: version ${have:-?} (build ${build:-?}). Asking Steam for the newest '${PZ_BRANCH}'…"
+  latest=$(steam_latest_build "${PZ_BRANCH:-public}")
+  echo "installed_branch=${have} installed_build=${build} latest_build=${latest:-unknown}"
+  if [[ $have == "${PZ_BRANCH:-public}" && -n $latest && $latest == "$build" ]] && server_files_ok; then
+    ok "Already up to date — nothing to download."
+    echo "update=no"; return 0
+  fi
+  if [[ $check == yes ]]; then
+    [[ $have != "${PZ_BRANCH:-public}" ]] && info "Version change: ${have} → ${PZ_BRANCH}" || info "A newer build is available (${build:-?} → ${latest:-?})."
+    echo "update=yes"; return 0
+  fi
+  warn "All friends must have the same game version (${PZ_BRANCH}) to join."
   local was=no; server_active && was=yes
-  [[ $was == yes ]] && { cmd_stop || return 1; }
-  step "Update server files" install_server force && step "Re-apply memory setting" set_xmx || { on_fail; return 1; }
-  ok "Server is on version ${PZ_BRANCH}."
+  NEED_RESTART=no
+  step "Update server files" install_server update && step "Re-apply memory setting" set_xmx || { on_fail; return 1; }
+  ok "Server is on version ${PZ_BRANCH} (build $(installed_build))."
   [[ $was == yes ]] && cmd_start
+  return 0
 }
 
 source_dir() { cat "${CONF_DIR}/source_dir" 2>/dev/null; }
@@ -1834,6 +1971,7 @@ cmd_self_update() {
   run bash "$src/install.sh" --no-launch || { LAST_ERROR="Update app"; on_fail; return 1; }
   ok "App updated to $(git -C "$src" log -1 --format='%h %s')"
   [[ ${PZHOST_GUI:-} == 1 ]] && return 0   # the app restarts itself
+  release_lock
   if [[ $INSTALLED == yes ]] && ask_yn "Re-apply server settings with the new version (Repair)?" y; then
     exec /usr/local/bin/pzhost setup
   fi
@@ -2018,7 +2156,8 @@ menu() {
   0) Quit
 EOF
       case $(ask "Choose" 1) in
-        1) cmd_setup ;; 2) cmd_netcheck ;; 3) cmd_report ;; 4) cmd_self_update ;; 5) cmd_pingcheck ;; 0|q) exit 0 ;;
+        1) acquire_lock "setup" && { cmd_setup; release_lock; } ;; 2) cmd_netcheck ;; 3) cmd_report ;;
+        4) acquire_lock "app update" && cmd_self_update; release_lock ;; 5) cmd_pingcheck ;; 0|q) exit 0 ;;
       esac
       pause; continue
     fi
@@ -2043,13 +2182,18 @@ EOF
                                     18) ${W}Ping check${N}
    0) Quit
 EOF
-    case $(ask "Choose" 4) in
+    local choice; choice=$(ask "Choose" 4)
+    case $choice in
+      1|2|3|8|9|11|13|15|16|17|19|20|21) acquire_lock "menu option ${choice}" || { pause; continue; } ;;
+    esac
+    case $choice in
       1) cmd_start ;; 2) cmd_stop ;; 3) cmd_restart ;; 4) cmd_join ;; 5) cmd_status ;;
       6) cmd_say ;; 7) cmd_save ;; 8) cmd_backup ;; 9) cmd_restore ;; 10) cmd_logs ;;
       11) cmd_settings ;; 12) cmd_netcheck ;; 13) cmd_update_server ;; 14) cmd_report ;;
       15) cmd_self_update ;; 16) cmd_setup ;; 17) cmd_uninstall ;; 18) cmd_pingcheck ;; 19) cmd_gameplay ;; 20) cmd_newworld ;; 21) cmd_laptop ;; 0|q) exit 0 ;;
       *) warn "Unknown choice." ;;
     esac
+    release_lock
     pause
   done
 }
@@ -2092,6 +2236,11 @@ main() {
   log INFO "──── pzhost ${PZHOST_VERSION} started: ${*:-menu} (user $(id -un))"
   local cmd=${1:-menu}; shift || true
   case $cmd in
+    setup|repair|start|stop|restart|backup|restore|update-server|new-world|newworld|reset|gameplay-set|set|\
+    uninstall|self-update|update|laptop-apply|laptop-limit)
+      acquire_lock "$cmd" || exit 1 ;;
+  esac
+  case $cmd in
     menu)          menu ;;
     setup|repair)  cmd_setup ;;
     start)         cmd_start ;;
@@ -2122,7 +2271,7 @@ main() {
     permission-text) N='' W='' show_permission_screen ;;
     update-check)  if update_available; then echo "update=yes"; else echo "update=no"; fi ;;
     gui)           exec /usr/local/bin/pzhost-gui ;;
-    update-server) cmd_update_server ;;
+    update-server) cmd_update_server "$@" ;;
     report)        cmd_report ;;
     self-update|update) cmd_self_update ;;
     uninstall)     cmd_uninstall "$@" ;;

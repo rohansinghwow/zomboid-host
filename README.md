@@ -49,6 +49,12 @@ The **Zomboid Host** window opens by itself (later: app menu or desktop icon).
 | **Laptop** | **Make this laptop a server**: battery stops at 80%, no sleep, Wi-Fi never sleeps + reconnects by itself, server starts on boot |
 | **More** | Join password, memory, auto-save, game version · ping check · server log · **Send error report** · **Update this app** · repair · uninstall |
 
+**Repair and updates never redo work:** the ~5 GB server is downloaded once. Repair fixes only what is
+missing, keeps your world, passwords, gameplay and server settings (max players, PvP, mods…), and keeps the
+server running unless a change needs a restart. **Check for a game server update** asks Steam first and downloads
+only if there is a newer build (the running server is stopped and started again for you). A Zomboid server started
+outside the app (e.g. the game's own *Host* button) is stopped before ours starts, and only one task runs at a time.
+
 Prefer the terminal? **Zomboid Host (terminal)** in the app menu, or type `pzhost` — same features as a numbered menu
 (19 gameplay, 20 new world, 21 laptop server mode, 14 error report, 15 update).
 

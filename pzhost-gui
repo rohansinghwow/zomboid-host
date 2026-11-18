@@ -247,6 +247,8 @@ class Window(Adw.ApplicationWindow):
         self.banner = Adw.Banner(title="An app update is available", button_label="Update now")
         self.banner.connect("button-clicked", lambda *_: app.update_app())
         self.root.add_top_bar(self.banner)
+        self.busy = Adw.Banner(title="")
+        self.root.add_top_bar(self.busy)
 
         self.stack = Adw.ViewStack()
         self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
@@ -345,12 +347,29 @@ class SetupPage(Adw.Bin):
         b.add(go)
         page.add(b)
 
+    def update(self, s):
+        """Fill the form with the settings that already exist (e.g. after an uninstall or a failed setup)."""
+        if getattr(self, "_filled", False):
+            return
+        self._filled = True
+        if s.get("branch"):
+            self.version.set_text(s["branch"])
+        self.net.set_selected(1 if s.get("network") == "portforward" else 0)
+        if s.get("autostart"):
+            self.autostart.set_active(s["autostart"] == "yes")
+        if s.get("join_password"):
+            self.join_pw.set_title("Join password — leave empty to keep the current one")
+        if s.get("admin_set") == "yes":
+            self.admin_pw.set_title("Admin password — already set, leave empty to keep it")
+
     def start(self):
         jp, ap = self.join_pw.get_text(), self.admin_pw.get_text()
-        if not PW_RE.match(jp) or not PW_RE.match(ap):
+        have_jp = bool(self.app.status.get("join_password"))
+        have_ap = self.app.status.get("admin_set") == "yes"
+        if (jp or not have_jp) and not PW_RE.match(jp) or (ap or not have_ap) and not PW_RE.match(ap):
             self.app.win.toast("Passwords: 4–32 letters, numbers, - or _")
             return
-        if jp == ap:
+        if jp and jp == ap:
             self.app.win.toast("Use a different admin password")
             return
         ram = int(self.app.status.get("ram_gb") or 16)
@@ -829,8 +848,12 @@ class MorePage(Adw.Bin):
         self._action(h, "Network check", "Does Jio allow port forwarding?", "Check",
                      lambda: app.run_task("Network check", ["netcheck"]))
         self._action(h, "Server log", "The last messages from the game server", "Show", self.show_log)
-        self._action(h, "Repair", "Runs the setup again (keeps your world and settings)", "Repair",
-                     lambda: app.with_permission(lambda: app.run_task("Repairing", ["setup"])))
+        self._action(h, "Check for a game server update",
+                     "Downloads only if Steam has a newer build — friends must update their game too",
+                     "Check", self.check_update)
+        self._action(h, "Repair", "Fixes only what is missing or wrong. Keeps your world, settings and the "
+                                  "downloaded server — the server keeps running if nothing needs a restart",
+                     "Repair…", self.repair)
         self._action(h, "Send error report", "Sends the logs (passwords removed) so the problem can be fixed",
                      "Send…", app.send_report)
         self._action(h, "Update this app", "Gets the newest version from GitHub", "Update", app.update_app)
@@ -900,6 +923,34 @@ class MorePage(Adw.Bin):
                          "All friends must switch their game to the same version. This downloads the server "
                          "files again.", "Switch",
                          lambda: self.app.run_task(f"Switching to {v}", ["set", "version", v]))
+
+    def repair(self):
+        dlg = Adw.AlertDialog(heading="Repair the server setup?",
+                              body="Your world, passwords, gameplay and server settings are kept. Nothing is "
+                                   "downloaded again unless server files are missing.")
+        chk = Gtk.CheckButton(label="Also check every server file and re-download broken ones (slow, ~5 GB check)")
+        dlg.set_extra_child(chk)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("go", "Repair")
+        dlg.set_response_appearance("go", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r == "go":
+                env = {"PZHOST_VALIDATE": "yes"} if chk.get_active() else {}
+                self.app.with_permission(lambda: self.app.run_task("Repairing", ["setup"], env))
+        dlg.connect("response", resp)
+        dlg.present(self.app.win)
+
+    def check_update(self):
+        def done(rc, out):
+            if rc == 0 and parse_kv(out).get("update") == "yes":
+                running = self.app.status.get("running") == "yes"
+                self.app.confirm("Update the game server now?",
+                                 ("The server stops, updates and starts again (a few minutes). " if running else "")
+                                 + "All friends must update their game to the same version.",
+                                 "Update", lambda: self.app.run_task("Updating the game server", ["update-server"]))
+        self.app.run_task("Checking for a game server update", ["update-server", "--check"], on_done=done)
 
     def show_log(self):
         def done(rc, out):
@@ -1005,9 +1056,14 @@ class App(Adw.Application):
             if not s:
                 return
             self.status = s
+            busy = s.get("busy", "")
+            self.win.busy.set_title(f"Working on: {busy} — other buttons wait until it's finished" if busy else "")
+            self.win.busy.set_revealed(bool(busy))
             installed = s.get("installed") == "yes"
             self.win.set_installed(installed)
             self.win.home.update(s)
+            if not installed:
+                self.win.setup_page.update(s)
             self.win.laptop.update(s)
             self.win.more.update(s)
         self.query(["gui-status"], done, timeout=30)
