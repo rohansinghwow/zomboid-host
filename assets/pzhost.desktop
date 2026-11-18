@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Zomboid Host
+GenericName=Project Zomboid Server
+Comment=Install, run and manage the Project Zomboid server for friends
+Exec=/usr/local/bin/pzhost
+Icon=pzhost
+Terminal=true
+Categories=Game;Network;
+Keywords=zomboid;server;pz;

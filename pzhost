@@ -1,0 +1,1276 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  pzhost — Project Zomboid dedicated server manager for CachyOS / Arch Linux
+#  One app that installs, runs, backs up and troubleshoots a private
+#  Build 42 server for a small group of friends (Windows + Mac clients).
+#
+#  Usage:  pzhost            (interactive menu)
+#          pzhost help       (list all commands)
+# =============================================================================
+
+PZHOST_VERSION="1.0.0"
+REPO="rohansinghwow/zomboid-host"
+
+# ---- fixed paths -------------------------------------------------------------
+PZ_USER="pz"
+PZ_HOME="/home/${PZ_USER}"
+SERVER_DIR="${PZ_HOME}/pzserver"
+STEAMCMD_DIR="${PZ_HOME}/steamcmd"
+ZOMBOID_DIR="${PZ_HOME}/Zomboid"
+CONTROL="${PZ_HOME}/pzserver.control"
+BACKUP_DIR="${PZ_HOME}/backups"
+LIB_DIR="/usr/local/lib/pzhost"
+UNIT_DIR="/etc/systemd/system"
+LOGIND_DROPIN="/etc/systemd/logind.conf.d/pzhost-no-lid-sleep.conf"
+SYSCTL_FILE="/etc/sysctl.d/90-pzhost.conf"
+NM_WIFI_CONF="/etc/NetworkManager/conf.d/pzhost-wifi-powersave.conf"
+TS_PORT=41641
+SLEEP_TARGETS=(sleep.target suspend.target hibernate.target hybrid-sleep.target)
+GAME_PORT=16261
+UDP_PORT=16262
+APP_ID=380870
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pzhost"
+CONF="${CONF_DIR}/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pzhost"
+LOG_FILE="${STATE_DIR}/pzhost.log"
+JOIN_CARD="${HOME}/ZOMBOID_JOIN_INFO.txt"
+
+set -o pipefail
+set -E
+
+# ---- colours -----------------------------------------------------------------
+if [[ -t 1 ]]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; C=$'\e[36m'; W=$'\e[1m'; D=$'\e[2m'; N=$'\e[0m'
+else
+  R=; G=; Y=; B=; C=; W=; D=; N=
+fi
+
+# =============================================================================
+#  Logging
+# =============================================================================
+mkdir -p "$STATE_DIR" "$CONF_DIR"
+touch "$LOG_FILE"
+
+log()   { printf '%s [%-5s] %s\n' "$(date '+%F %T')" "$1" "${*:2}" >>"$LOG_FILE"; }
+info()  { echo "${C}•${N} $*"; log INFO "$*"; }
+ok()    { echo "${G}✔${N} $*"; log OK "$*"; }
+warn()  { echo "${Y}!${N} $*"; log WARN "$*"; }
+err()   { echo "${R}✘ $*${N}" >&2; log ERROR "$*"; }
+
+# Trace every failing command (with line number) into the log for debugging.
+trap 'log TRACE "rc=$? line=${LINENO} func=${FUNCNAME[0]:-main} cmd=${BASH_COMMAND}"' ERR
+
+# run CMD... — run a command, copy its full output to the screen and the log.
+run() {
+  log CMD "$*"
+  "$@" 2>&1 | tee -a "$LOG_FILE"
+  local rc=${PIPESTATUS[0]}
+  log RC "$rc ← $1"
+  return "$rc"
+}
+
+LAST_ERROR=""
+# step "Title" func args... — one setup step with clear success/failure output.
+step() {
+  local title=$1; shift
+  echo; echo "${B}${W}▶ ${title}${N}"; log STEP "$title"
+  if "$@"; then
+    echo "${G}  ✔ ${title}${N}"; log OK "step: $title"; return 0
+  fi
+  LAST_ERROR="$title"
+  echo "${R}  ✘ ${title} — failed${N}"; log FAIL "step: $title"
+  return 1
+}
+
+pause() { [[ -t 0 ]] && read -r -p "${D}Press Enter to continue…${N}" _; }
+
+# =============================================================================
+#  Prompts
+# =============================================================================
+ask() {   # ask "Question" [default]  → prints answer
+  local a; read -r -p "$1${2:+ [${2}]}: " a; echo "${a:-$2}"
+}
+ask_yn() {  # ask_yn "Question" [y|n]
+  local d=${2:-n} a hint="y/N"; [[ $d == y ]] && hint="Y/n"
+  read -r -p "$1 [$hint] " a; a=${a:-$d}; [[ ${a,,} == y* ]]
+}
+ask_secret() {  # ask_secret "Label" → prints password (letters, digits, - and _ only)
+  local p p2
+  while :; do
+    read -r -s -p "$1 (4-32 chars: letters, digits, - or _): " p; echo >&2
+    if [[ ! $p =~ ^[A-Za-z0-9_-]{4,32}$ ]]; then echo "${Y}  Not allowed — try again.${N}" >&2; continue; fi
+    read -r -s -p "  Type it again: " p2; echo >&2
+    [[ $p == "$p2" ]] && break
+    echo "${Y}  Didn't match — try again.${N}" >&2
+  done
+  echo "$p"
+}
+
+# =============================================================================
+#  Config
+# =============================================================================
+SERVER_NAME="servertest"
+PZ_BRANCH="42.21"
+XMX="6g"
+SAVE_MINUTES="10"
+JOIN_PASSWORD=""
+ADMIN_PASSWORD=""
+NETWORK_MODE="tailscale"     # tailscale | portforward
+AUTOSTART="no"
+BACKUP_KEEP_DAYS="7"
+PERMISSION_GRANTED="no"
+INSTALLED="no"
+INSTALLED_BRANCH=""
+
+load_config() { [[ -f $CONF ]] && source "$CONF"; }
+save_config() {
+  umask 077
+  {
+    echo "# pzhost config — written $(date '+%F %T'). Keep private (contains passwords)."
+    for v in SERVER_NAME PZ_BRANCH XMX SAVE_MINUTES JOIN_PASSWORD ADMIN_PASSWORD NETWORK_MODE \
+             AUTOSTART BACKUP_KEEP_DAYS PERMISSION_GRANTED INSTALLED INSTALLED_BRANCH; do
+      printf '%s=%q\n' "$v" "${!v}"
+    done
+  } >"$CONF"
+  chmod 600 "$CONF"
+}
+
+# =============================================================================
+#  Permission + sudo
+# =============================================================================
+SUDO_KEEPALIVE_PID=""
+cleanup() { [[ -n $SUDO_KEEPALIVE_PID ]] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null; }
+trap cleanup EXIT
+
+sudo_start() {
+  [[ -n $SUDO_KEEPALIVE_PID ]] && sudo -n true 2>/dev/null && return 0
+  echo "${D}Your password is needed once for this session (sudo).${N}"
+  sudo -v || { err "sudo password was not accepted."; return 1; }
+  ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) &
+  SUDO_KEEPALIVE_PID=$!
+}
+
+show_permission_screen() {
+  cat <<EOF
+
+${W}════════════════════ Permission needed ════════════════════${N}
+To host the Zomboid server, this app will make these changes:
+
+ ${W}Install packages${N} (pacman): lib32-gcc-libs curl tar git github-cli
+                              + tailscale (if you choose Tailscale)
+                              (may run a full system update if pacman asks)
+ ${W}Create a system user${N} "${PZ_USER}" (home ${PZ_HOME}) that runs the server
+ ${W}Download${N} SteamCMD + Project Zomboid server (~5 GB) into ${PZ_HOME}
+ ${W}Create services${N}: pzserver (server), pzbackup (daily 05:00),
+                   pzrestart (daily 05:10 restart, only if running)
+ ${W}Power settings${N}: laptop will NOT sleep when the lid is closed,
+                   sleep/suspend/hibernate are disabled
+ ${W}Firewall${N}: open UDP ${GAME_PORT}-${UDP_PORT} (+ ${TS_PORT} for Tailscale direct)
+ ${W}Low-ping tuning${N}: Wi-Fi power saving OFF, bigger UDP buffers (sysctl),
+                   server runs at higher priority, "performance" power
+                   profile only while the server is running
+ ${W}Tailscale${N}: enable the tailscaled service and log in (if chosen)
+ ${W}Files${N}: settings in ${CONF_DIR}, logs in ${STATE_DIR},
+        join info in ${JOIN_CARD}
+
+Everything can be undone with: pzhost uninstall
+${W}═══════════════════════════════════════════════════════════${N}
+EOF
+}
+
+ensure_permission() {
+  if [[ $PERMISSION_GRANTED != yes ]]; then
+    show_permission_screen
+    local a; read -r -p "Type ${W}yes${N} to allow all of the above: " a
+    if [[ ${a,,} != yes ]]; then err "Permission not given — nothing was changed."; return 1; fi
+    PERMISSION_GRANTED=yes; save_config
+    log INFO "Permission granted by user $(id -un)"
+  fi
+  sudo_start
+}
+
+# =============================================================================
+#  Helpers
+# =============================================================================
+as_pz() { ( cd / && sudo -u "$PZ_USER" -H "$@" ); }
+server_active() { systemctl is-active -q pzserver.service; }
+total_ram_gb() { awk '/MemTotal/ {printf "%d", ($2/1024/1024)+0.5}' /proc/meminfo; }
+local_ip() { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'; }
+gateway_ip() { ip -4 route show default 2>/dev/null | awk '{print $3; exit}'; }
+public_ip() { curl -4 -fsS --max-time 8 https://ifconfig.me 2>/dev/null || curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null; }
+tailscale_ip() { command -v tailscale >/dev/null || return 1; tailscale ip -4 2>/dev/null | head -1; }
+is_cgnat_ip() { local a b; IFS=. read -r a b _ _ <<<"$1"; [[ $a == 100 ]] && (( b >= 64 && b <= 127 )); }
+is_private_ip() {
+  local a b; IFS=. read -r a b _ _ <<<"$1"
+  [[ $a == 10 ]] || { [[ $a == 172 ]] && (( b >= 16 && b <= 31 )); } || [[ $a.$b == 192.168 ]] || is_cgnat_ip "$1"
+}
+
+require_installed() {
+  if [[ $INSTALLED != yes ]]; then err "Server is not installed yet. Run Setup first (pzhost setup)."; return 1; fi
+}
+
+send_console() {  # send a console command to the running server
+  server_active || { err "Server is not running."; return 1; }
+  printf '%s\n' "$1" | sudo tee "$CONTROL" >/dev/null && log INFO "console ← $1"
+}
+
+set_ini() {  # set_ini KEY VALUE — replace in place or append
+  local f="${ZOMBOID_DIR}/Server/${SERVER_NAME}.ini" k=$1 v=$2
+  if as_pz grep -q "^${k}=" "$f"; then
+    as_pz sed -i "s|^${k}=.*|${k}=${v}|" "$f"
+  else
+    printf '%s=%s\n' "$k" "$v" | as_pz tee -a "$f" >/dev/null
+  fi
+  log INFO "ini: ${k} set"
+}
+
+# =============================================================================
+#  Setup steps
+# =============================================================================
+setup_questions() {
+  echo; echo "${W}A few questions first (Enter = default):${N}"
+
+  PZ_BRANCH=$(ask "Game version / Steam branch (must match ALL friends' game version)" "$PZ_BRANCH")
+
+  local ram; ram=$(total_ram_gb)
+  echo "  Detected ${ram} GB RAM."
+  if ask_yn "  Will you also PLAY the game on this same laptop?" y; then
+    (( ram >= 15 )) && XMX="6g" || XMX="3g"
+  else
+    (( ram >= 15 )) && XMX="8g" || XMX="4g"
+  fi
+  XMX=$(ask "  Server memory (-Xmx)" "$XMX")
+
+  SAVE_MINUTES=$(ask "Auto-save the world every N minutes" "$SAVE_MINUTES")
+
+  if [[ -z $JOIN_PASSWORD ]] || ask_yn "Change the join password your friends type?" n; then
+    JOIN_PASSWORD=$(ask_secret "Join password for friends")
+  fi
+  if [[ -z $ADMIN_PASSWORD ]]; then
+    ADMIN_PASSWORD=$(ask_secret "Admin password (different from join password, only for you)")
+  fi
+
+  echo
+  echo "How will friends reach this laptop?"
+  echo "  1) Tailscale  ${G}(recommended — works with Jio CGNAT, nothing to change on router)${N}"
+  echo "  2) Router port forwarding (only works if Jio gives you a real public IP)"
+  local n; n=$(ask "Choose" "$([[ $NETWORK_MODE == portforward ]] && echo 2 || echo 1)")
+  [[ $n == 2 ]] && NETWORK_MODE=portforward || NETWORK_MODE=tailscale
+
+  ask_yn "Start the server automatically when the laptop boots?" n && AUTOSTART=yes || AUTOSTART=no
+  save_config
+}
+
+preflight() {
+  local id_like; id_like=$(. /etc/os-release && echo "${ID} ${ID_LIKE:-}")
+  info "OS: $(. /etc/os-release && echo "$PRETTY_NAME"), kernel $(uname -r)"
+  [[ $id_like == *arch* || $id_like == *cachyos* ]] || { err "This app supports CachyOS / Arch Linux only."; return 1; }
+  command -v pacman >/dev/null || { err "pacman not found."; return 1; }
+  command -v systemctl >/dev/null || { err "systemd not found."; return 1; }
+  [[ $(uname -m) == x86_64 ]] || { err "x86_64 CPU required (found $(uname -m))."; return 1; }
+
+  local cpu ram free_gb
+  cpu=$(awk -F: '/model name/ {gsub(/^ +/,"",$2); print $2; exit}' /proc/cpuinfo)
+  ram=$(total_ram_gb)
+  free_gb=$(df -BG --output=avail /home | tail -1 | tr -dc '0-9')
+  info "CPU: ${cpu} ($(nproc) threads) · RAM: ${ram} GB · Free on /home: ${free_gb} GB"
+  (( ram < 8 )) && warn "Less than 8 GB RAM — the server may run out of memory."
+  (( free_gb < 15 )) && { err "Need at least 15 GB free disk space on /home."; return 1; }
+
+  if ls /sys/class/power_supply/A{C,DP}*/online >/dev/null 2>&1; then
+    grep -q 1 /sys/class/power_supply/A{C,DP}*/online 2>/dev/null || warn "Laptop is on battery — plug in the charger for hosting."
+  fi
+
+  info "Checking internet / Steam CDN…"
+  curl -fsS --max-time 15 -r 0-99 -o /dev/null \
+    https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz \
+    || { err "Cannot reach the Steam download server. Check the internet connection."; return 1; }
+  ok "Internet OK"
+}
+
+install_packages() {
+  local pkgs=(lib32-gcc-libs curl tar git github-cli)
+  [[ $NETWORK_MODE == tailscale ]] && pkgs+=(tailscale)
+  local missing=() p
+  for p in "${pkgs[@]}"; do pacman -Qi "$p" >/dev/null 2>&1 || missing+=("$p"); done
+  if (( ${#missing[@]} == 0 )); then ok "All packages already installed"; return 0; fi
+  info "Installing: ${missing[*]}"
+  if ! run sudo pacman -S --needed --noconfirm "${missing[@]}"; then
+    warn "Install failed — package database may be out of date. Running a full system update and retrying…"
+    run sudo pacman -Syu --noconfirm || return 1
+    run sudo pacman -S --needed --noconfirm "${missing[@]}" || return 1
+  fi
+}
+
+create_user() {
+  if id "$PZ_USER" >/dev/null 2>&1; then ok "User ${PZ_USER} exists"; return 0; fi
+  run sudo useradd -m -s /bin/bash "$PZ_USER"
+}
+
+install_steamcmd() {
+  if as_pz test -x "${STEAMCMD_DIR}/steamcmd.sh"; then ok "SteamCMD already installed"; return 0; fi
+  as_pz mkdir -p "$STEAMCMD_DIR" || return 1
+  run as_pz bash -c "cd '${STEAMCMD_DIR}' && curl -fsSL https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz | tar zxf -"
+}
+
+show_branches() {
+  info "Asking Steam for the list of available versions (branches)…"
+  as_pz "${STEAMCMD_DIR}/steamcmd.sh" +login anonymous +app_info_update 1 +app_info_print "$APP_ID" +quit 2>&1 \
+    | tee -a "$LOG_FILE" \
+    | awk '/"branches"/{f=1;next} f && /^[\t ]*"[^"]+"[\t ]*$/ {gsub(/[\t "]/,""); print "   - " $0}' \
+    | head -40
+}
+
+install_server() {  # install_server [force]
+  if [[ $1 != force ]] && as_pz test -x "${SERVER_DIR}/start-server.sh" && [[ $INSTALLED_BRANCH == "$PZ_BRANCH" ]]; then
+    ok "Server files already installed (version ${PZ_BRANCH})"; return 0
+  fi
+  local beta=() out attempt
+  [[ -n $PZ_BRANCH && $PZ_BRANCH != public ]] && beta=(-beta "$PZ_BRANCH")
+  out=$(mktemp)
+  for attempt in 1 2 3; do
+    info "Downloading server (version ${PZ_BRANCH}), attempt ${attempt}/3 — this can take a while…"
+    as_pz "${STEAMCMD_DIR}/steamcmd.sh" +force_install_dir "$SERVER_DIR" +login anonymous \
+      +app_update "$APP_ID" "${beta[@]}" validate +quit 2>&1 | tee -a "$LOG_FILE" "$out"
+    if grep -q "Success! App '${APP_ID}'" "$out"; then
+      INSTALLED_BRANCH="$PZ_BRANCH"; save_config; rm -f "$out"; return 0
+    fi
+    if grep -qiE "invalid beta|beta.*(not found|doesn't exist)|Invalid platform" "$out"; then
+      err "Steam says version/branch '${PZ_BRANCH}' does not exist."
+      show_branches
+      echo "${Y}Pick one of the names above in Settings → Game version, then run Repair.${N}"
+      rm -f "$out"; return 1
+    fi
+    sleep 3
+  done
+  rm -f "$out"
+  err "SteamCMD did not finish the download after 3 attempts (see log)."
+  return 1
+}
+
+set_xmx() {
+  local f="${SERVER_DIR}/ProjectZomboid64.json"
+  as_pz test -f "$f" || { err "Missing $f"; return 1; }
+  as_pz sed -E -i "s/\"-Xmx[0-9]+[gGmM]\"/\"-Xmx${XMX}\"/" "$f" || return 1
+  as_pz grep -q "\"-Xmx${XMX}\"" "$f" || { err "Could not set -Xmx in $f"; return 1; }
+  ok "Server memory set to ${XMX}"
+}
+
+write_units() {
+  sudo mkdir -p "$LIB_DIR"
+
+  sudo tee "${LIB_DIR}/pz-backup.sh" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+# Daily/manual world backup. Runs as user pz.
+set -uo pipefail
+CONTROL=/home/pz/pzserver.control
+DEST=/home/pz/backups
+KEEP_DAYS=${1:-7}
+mkdir -p "$DEST"
+if systemctl is-active -q pzserver.service && [ -p "$CONTROL" ]; then
+  echo "Asking server to save…"; echo save > "$CONTROL"; sleep 30
+fi
+cd /home/pz || exit 1
+parts=()
+for p in Zomboid/Saves/Multiplayer Zomboid/Server Zomboid/db; do [ -e "$p" ] && parts+=("$p"); done
+[ ${#parts[@]} -gt 0 ] || { echo "Nothing to back up yet."; exit 0; }
+f="$DEST/pz-$(date +%F_%H%M).tar.gz"
+tar czf "$f" "${parts[@]}"; rc=$?
+[ $rc -le 1 ] || { echo "tar failed (rc=$rc)"; exit $rc; }
+find "$DEST" -name 'pz-*.tar.gz' -mtime +"$KEEP_DAYS" -delete
+echo "Backup written: $f ($(du -h "$f" | cut -f1))"
+EOF
+
+  sudo tee "${LIB_DIR}/pz-restart.sh" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+# Daily restart (only if the server is running), with a 1-minute warning.
+systemctl is-active -q pzserver.service || { echo "Server not running — nothing to restart."; exit 0; }
+echo 'servermsg "Daily restart in 1 minute"' > /home/pz/pzserver.control
+sleep 60
+systemctl restart pzserver.service
+EOF
+  sudo chmod 755 "${LIB_DIR}/pz-backup.sh" "${LIB_DIR}/pz-restart.sh"
+
+  local PPD_LINES=""
+  if command -v powerprofilesctl >/dev/null; then
+    PPD_LINES=$'ExecStartPre=-+/usr/bin/powerprofilesctl set performance\nExecStopPost=-+/usr/bin/powerprofilesctl set balanced'
+  fi
+
+  sudo tee "${UNIT_DIR}/pzserver.socket" >/dev/null <<EOF
+[Unit]
+Description=Project Zomboid server console (FIFO)
+BindsTo=pzserver.service
+
+[Socket]
+ListenFIFO=${CONTROL}
+FileDescriptorName=control
+RemoveOnStop=true
+SocketMode=0660
+SocketUser=${PZ_USER}
+EOF
+
+  sudo tee "${UNIT_DIR}/pzserver.service" >/dev/null <<EOF
+[Unit]
+Description=Project Zomboid dedicated server (managed by pzhost)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=${PZ_USER}
+Group=${PZ_USER}
+WorkingDirectory=${SERVER_DIR}
+Sockets=pzserver.socket
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+ExecStart=${SERVER_DIR}/start-server.sh -nosteam -servername ${SERVER_NAME}
+ExecStop=/bin/sh -c "echo save > ${CONTROL}; sleep 15; echo quit > ${CONTROL}"
+KillSignal=SIGCONT
+TimeoutStopSec=120
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+${PPD_LINES}
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo tee "${UNIT_DIR}/pzbackup.service" >/dev/null <<EOF
+[Unit]
+Description=Project Zomboid world backup (managed by pzhost)
+
+[Service]
+Type=oneshot
+User=${PZ_USER}
+ExecStart=${LIB_DIR}/pz-backup.sh ${BACKUP_KEEP_DAYS}
+EOF
+
+  sudo tee "${UNIT_DIR}/pzbackup.timer" >/dev/null <<'EOF'
+[Unit]
+Description=Daily Project Zomboid backup
+
+[Timer]
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  sudo tee "${UNIT_DIR}/pzrestart.service" >/dev/null <<EOF
+[Unit]
+Description=Daily Project Zomboid restart (managed by pzhost)
+
+[Service]
+Type=oneshot
+ExecStart=${LIB_DIR}/pz-restart.sh
+EOF
+
+  sudo tee "${UNIT_DIR}/pzrestart.timer" >/dev/null <<'EOF'
+[Unit]
+Description=Daily Project Zomboid restart
+
+[Timer]
+OnCalendar=*-*-* 05:10:00
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  run sudo systemctl daemon-reload || return 1
+  run sudo systemctl enable --now pzbackup.timer pzrestart.timer || return 1
+  if [[ $AUTOSTART == yes ]]; then
+    run sudo systemctl enable pzserver.service
+  else
+    run sudo systemctl disable pzserver.service 2>/dev/null || true
+  fi
+}
+
+# Wait for "SERVER STARTED" in the journal since timestamp $1, timeout $2 seconds.
+wait_ready() {
+  local since=$1 timeout=$2 t0 el last
+  t0=$(date +%s)
+  while :; do
+    if sudo journalctl -q -u pzserver.service --since "@${since}" -o cat --no-pager 2>/dev/null | grep -q "SERVER STARTED"; then
+      printf '\n'; return 0
+    fi
+    if ! server_active; then
+      printf '\n'; err "Server stopped unexpectedly. Last log lines:"
+      sudo journalctl -q -u pzserver.service --since "@${since}" -o cat --no-pager -n 40 | tee -a "$LOG_FILE"
+      return 1
+    fi
+    el=$(( $(date +%s) - t0 ))
+    if (( el > timeout )); then printf '\n'; err "Server did not finish starting within ${timeout}s."; return 1; fi
+    last=$(sudo journalctl -q -u pzserver.service --since "@${since}" -o cat --no-pager -n 1 2>/dev/null | cut -c1-60)
+    printf '\r  %s⏳ %4ds%s  %-60s' "$Y" "$el" "$N" "$last"
+    sleep 5
+  done
+}
+
+first_run() {
+  if as_pz test -f "${ZOMBOID_DIR}/Server/${SERVER_NAME}.ini"; then ok "World already created"; return 0; fi
+  info "First start: creating the world and admin account (can take 5–20 minutes)…"
+  local dropin="${UNIT_DIR}/pzserver.service.d/10-firstrun.conf" ts rc=0
+  sudo mkdir -p "$(dirname "$dropin")"
+  sudo tee "$dropin" >/dev/null <<EOF
+[Service]
+ExecStart=
+ExecStart=${SERVER_DIR}/start-server.sh -nosteam -servername ${SERVER_NAME} -adminpassword ${ADMIN_PASSWORD}
+Restart=no
+EOF
+  sudo chmod 600 "$dropin"
+  sudo systemctl daemon-reload
+  ts=$(date +%s)
+  run sudo systemctl start pzserver.service || rc=1
+  (( rc == 0 )) && { wait_ready "$ts" 1800 || rc=1; }
+  info "Stopping after first start (saving)…"
+  sudo systemctl stop pzserver.service
+  sudo rm -f "$dropin"; sudo systemctl daemon-reload
+  (( rc == 0 )) || return 1
+  as_pz test -f "${ZOMBOID_DIR}/Server/${SERVER_NAME}.ini" || { err "Server config file was not created."; return 1; }
+}
+
+configure_ini() {
+  set_ini Public false
+  set_ini Password "$JOIN_PASSWORD"
+  set_ini MaxPlayers 8
+  set_ini DefaultPort "$GAME_PORT"
+  set_ini UDPPort "$UDP_PORT"
+  set_ini SaveWorldEveryMinutes "$SAVE_MINUTES"
+  set_ini BackupsCount 5
+  set_ini BackupsOnStart true
+  set_ini BackupsOnVersionChange true
+  set_ini BackupsPeriod 60
+}
+
+no_sleep() {
+  sudo mkdir -p "$(dirname "$LOGIND_DROPIN")"
+  sudo tee "$LOGIND_DROPIN" >/dev/null <<'EOF'
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+EOF
+  run sudo systemctl mask "${SLEEP_TARGETS[@]}" || return 1
+  # logind re-reads config on reload; a full restart would log the user out.
+  sudo systemctl kill -s HUP systemd-logind 2>/dev/null || true
+  ok "Lid close / sleep disabled"
+}
+
+firewall_open() {
+  if command -v ufw >/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+    run sudo ufw allow "${GAME_PORT}:${UDP_PORT}/udp" comment 'Project Zomboid' || return 1
+    if [[ $NETWORK_MODE == tailscale ]]; then
+      run sudo ufw allow in on tailscale0 comment 'Tailscale' || return 1
+      run sudo ufw allow "${TS_PORT}/udp" comment 'Tailscale direct' || return 1
+    fi
+    ok "ufw: ports opened"
+  elif systemctl is-active -q firewalld; then
+    run sudo firewall-cmd --permanent --add-port="${GAME_PORT}-${UDP_PORT}/udp" || return 1
+    [[ $NETWORK_MODE == tailscale ]] && run sudo firewall-cmd --permanent --zone=trusted --add-interface=tailscale0 \
+      && run sudo firewall-cmd --permanent --add-port="${TS_PORT}/udp"
+    run sudo firewall-cmd --reload || return 1
+    ok "firewalld: ports opened"
+  else
+    ok "No active firewall — ports are already reachable"
+  fi
+}
+
+wifi_iface() {  # prints the Wi-Fi interface used for internet, if any
+  local dev; dev=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+  [[ -n $dev && -d /sys/class/net/$dev/wireless ]] && echo "$dev"
+}
+
+optimize_network() {
+  # Bigger socket buffers + fair queueing: fewer drops/spikes for game UDP traffic.
+  sudo tee "$SYSCTL_FILE" >/dev/null <<'EOF'
+# pzhost: low-latency tuning for the Project Zomboid server
+net.core.rmem_max = 4194304
+net.core.wmem_max = 4194304
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.netdev_max_backlog = 5000
+net.core.default_qdisc = fq_codel
+EOF
+  run sudo sysctl -q -p "$SYSCTL_FILE" || return 1
+  ok "Network buffers tuned"
+
+  # Wi-Fi power saving causes 50-300 ms ping spikes; turn it off permanently.
+  if [[ -d /etc/NetworkManager ]]; then
+    sudo mkdir -p "$(dirname "$NM_WIFI_CONF")"
+    printf '[connection]\nwifi.powersave = 2\n' | sudo tee "$NM_WIFI_CONF" >/dev/null
+    sudo systemctl reload NetworkManager 2>/dev/null || true
+    ok "Wi-Fi power saving disabled (permanent)"
+  fi
+  local w; w=$(wifi_iface)
+  if [[ -n $w ]]; then
+    command -v iw >/dev/null && sudo iw dev "$w" set power_save off 2>/dev/null
+    warn "You are on Wi-Fi (${w}). An Ethernet cable to the Jio router gives the most stable ping."
+  else
+    ok "Wired connection detected — best for ping"
+  fi
+  command -v powerprofilesctl >/dev/null \
+    && ok "Power profile switches to 'performance' while the server runs" \
+    || info "power-profiles-daemon not installed — skipping power profile tuning"
+  return 0
+}
+
+ping_stats() {  # ping_stats HOST COUNT → prints "avg jitter loss" (ms ms %)
+  ping -n -q -c "$2" -i 0.2 -W 2 "$1" 2>/dev/null | awk -F'[/ ,%]+' '
+    /packet loss/ {for(i=1;i<=NF;i++) if($i=="packet") loss=$(i-1)}
+    /rtt|round-trip/ {for(i=1;i<=NF;i++) if($i ~ /^[0-9.]+$/) v[++n]=$i}
+    END {printf "%s %s %s\n", (n>=4?v[n-2]:"-"), (n>=4?v[n]:"-"), (loss==""?"100":loss)}'
+}
+
+cmd_pingcheck() {
+  echo; echo "${W}── Ping check ──${N}"
+  local w gw r avg jit loss
+  w=$(wifi_iface); gw=$(gateway_ip)
+  if [[ -n $w ]]; then
+    local line; line=$(nmcli -t -f IN-USE,SSID,SIGNAL,FREQ dev wifi 2>/dev/null | grep '^\*' | head -1)
+    local sig freq; sig=$(cut -d: -f3 <<<"$line"); freq=$(cut -d: -f4 <<<"$line" | tr -dc '0-9')
+    echo "  Connection : ${Y}Wi-Fi${N} (${w}) · signal ${sig:-?}% · $( [[ ${freq:-0} -ge 4900 ]] && echo 5 GHz || echo "${Y}2.4 GHz${N}")"
+    [[ ${freq:-0} -lt 4900 ]] && warn "Use the Jio router's 5 GHz network (or Ethernet) — 2.4 GHz is slower and noisier."
+    [[ -n $sig && $sig -lt 60 ]] && warn "Weak signal — move the laptop closer to the router."
+    local ps; ps=$(command -v iw >/dev/null && iw dev "$w" get power_save 2>/dev/null)
+    [[ $ps == *on* ]] && warn "Wi-Fi power saving is ON — run Repair to turn it off."
+  else
+    echo "  Connection : ${G}Ethernet${N}"
+  fi
+
+  for target in "${gw:-192.168.29.1}:Router" "1.1.1.1:Internet"; do
+    read -r avg jit loss < <(ping_stats "${target%%:*}" 20)
+    printf '  %-10s : avg %s ms · jitter %s ms · loss %s%%\n' "${target##*:}" "$avg" "$jit" "$loss"
+    if [[ ${target##*:} == Router && $jit != - ]] && awk "BEGIN{exit !($jit > 5)}"; then
+      warn "High jitter to the router — Wi-Fi interference or someone downloading/streaming at home."
+    fi
+  done
+
+  if [[ $NETWORK_MODE == tailscale ]] && command -v tailscale >/dev/null; then
+    echo; echo "  ${W}Tailscale${N}"
+    tailscale netcheck 2>/dev/null | grep -E "UDP:|MappingVariesByDestIP|Nearest DERP" | sed 's/^\s*/    /'
+    echo "  ${W}Friends' connections${N} (direct = best ping, relay = slower):"
+    local peers; peers=$(tailscale status 2>/dev/null | tail -n +2 | grep -v '^#' | awk 'NF')
+    if [[ -z $peers ]]; then
+      echo "    (no friends connected right now — check again while they are in game)"
+    else
+      while read -r line; do
+        local name; name=$(awk '{print $2}' <<<"$line")
+        if [[ $line == *direct* ]]; then echo "    ${G}●${N} ${name}: direct"
+        elif [[ $line == *relay* ]]; then echo "    ${Y}●${N} ${name}: relay ($(grep -o 'relay "[^"]*"' <<<"$line"))"
+        else echo "    ${D}●${N} ${name}: idle/offline"; fi
+      done <<<"$peers"
+      echo "    ${D}Tip: 'tailscale ping <name>' forces a direct path attempt.${N}"
+    fi
+  fi
+
+  cat <<EOF
+
+  ${W}Tips for best ping on Jio${N}
+   • Ethernet cable from laptop to Jio router (biggest improvement)
+   • If Wi-Fi: use the 5 GHz network, keep the laptop near the router
+   • Pause big downloads / 4K streaming / game updates at home while playing
+   • Friends with "relay": their router blocks direct UDP. They can try
+     another network or a phone hotspot, or restart Tailscale
+   • Restart the Jio router once if pings suddenly get worse
+EOF
+}
+
+network_setup() {
+  if [[ $NETWORK_MODE == tailscale ]]; then
+    run sudo systemctl enable --now tailscaled || return 1
+    sleep 2
+    if tailscale_ip >/dev/null && [[ -n $(tailscale_ip) ]]; then
+      ok "Tailscale connected: $(tailscale_ip)"
+    else
+      info "Log in to Tailscale — open the link below in your browser:"
+      sudo tailscale up --operator="$USER" || return 1
+    fi
+    sudo tailscale set --operator="$USER" >/dev/null 2>&1 || true
+    [[ -n $(tailscale_ip) ]] || { err "Tailscale has no IP — login not finished?"; return 1; }
+    ok "Tailscale IP: $(tailscale_ip)"
+    tailscale_share_help
+  else
+    cmd_netcheck
+  fi
+}
+
+tailscale_share_help() {
+  cat <<EOF
+
+${W}Share this laptop with your 4 friends (one time):${N}
+  1. Open ${C}https://login.tailscale.com/admin/machines${N}
+  2. Find "${W}$(hostname)${N}" → click ⋯ → ${W}Share…${N}
+  3. Enter each friend's email → Send invite
+  4. Each friend installs Tailscale (${C}https://tailscale.com/download${N}),
+     signs in with that email and accepts the invite.
+EOF
+}
+
+cmd_setup() {
+  ensure_permission || return 1
+  local fresh=no
+  [[ -z $JOIN_PASSWORD || -z $ADMIN_PASSWORD || $INSTALLED != yes ]] && fresh=yes
+  if [[ $fresh == yes ]] || ask_yn "Review the setup answers (version, RAM, passwords, network)?" n; then
+    setup_questions
+  fi
+  log INFO "setup: branch=${PZ_BRANCH} xmx=${XMX} save=${SAVE_MINUTES} net=${NETWORK_MODE} autostart=${AUTOSTART}"
+  local was_running=no; server_active && was_running=yes
+
+  step "Check system"                     preflight         &&
+  step "Install packages"                 install_packages  &&
+  step "Create server user '${PZ_USER}'"  create_user       &&
+  step "Install SteamCMD"                 install_steamcmd  &&
+  { [[ $was_running == no ]] || sudo systemctl stop pzserver.service; } &&
+  step "Download Project Zomboid server"  install_server    &&
+  step "Set server memory"                set_xmx           &&
+  step "Create services and backups"      write_units       &&
+  step "Create world + admin account"     first_run         &&
+  step "Configure server (private, auto-save, backups)" configure_ini &&
+  step "Keep laptop awake"                no_sleep          &&
+  step "Firewall"                         firewall_open     &&
+  step "Low-ping network tuning"          optimize_network  &&
+  step "Network (${NETWORK_MODE})"        network_setup     || { on_fail; return 1; }
+
+  INSTALLED=yes; save_config
+  echo; ok "${W}Setup complete!${N}"
+  if [[ $was_running == yes ]] || ask_yn "Start the server now?" y; then cmd_start; else cmd_join; fi
+}
+
+# =============================================================================
+#  Server control
+# =============================================================================
+cmd_start() {
+  require_installed || return 1; sudo_start || return 1
+  if server_active; then ok "Server is already running."; cmd_join; return 0; fi
+  local ts; ts=$(date +%s)
+  info "Starting server…"
+  run sudo systemctl start pzserver.service || { LAST_ERROR="Start server"; on_fail; return 1; }
+  if wait_ready "$ts" 1200; then
+    ok "${W}Server is up!${N}"; cmd_join
+  else
+    LAST_ERROR="Start server"; on_fail; return 1
+  fi
+}
+
+cmd_stop() {
+  require_installed || return 1; sudo_start || return 1
+  server_active || { ok "Server is already stopped."; return 0; }
+  info "Saving world and stopping (about 20 seconds)…"
+  run sudo systemctl stop pzserver.service && ok "Server stopped and saved."
+}
+
+cmd_restart() { cmd_stop && cmd_start; }
+
+cmd_save() {
+  sudo_start || return 1
+  send_console save && ok "Save requested — the world is being written to disk."
+}
+
+cmd_say() {
+  sudo_start || return 1
+  local m=${1:-}; [[ -z $m ]] && m=$(ask "Message to all players")
+  [[ -z $m ]] && return 0
+  m=${m//\"/\'}
+  send_console "servermsg \"${m}\"" && ok "Message sent."
+}
+
+cmd_players() {
+  sudo_start || return 1
+  local ts; ts=$(date +%s)
+  send_console players || return 1
+  sleep 2
+  echo "${W}Players online:${N}"
+  sudo journalctl -q -u pzserver.service --since "@${ts}" -o cat --no-pager | sed 's/^/  /'
+}
+
+cmd_logs() {
+  sudo_start || return 1
+  echo "${D}Live server log — press Ctrl+C to go back.${N}"
+  trap ':' INT
+  sudo journalctl -u pzserver.service -f -n 100 -o cat
+  trap - INT
+}
+
+cmd_status() {
+  sudo_start || return 1
+  echo; echo "${W}── Status ──${N}"
+  if server_active; then
+    local mem; mem=$(systemctl show -p MemoryCurrent --value pzserver.service)
+    [[ $mem =~ ^[0-9]+$ ]] && mem="$(( mem / 1024 / 1024 )) MB" || mem="?"
+    echo "  Server   : ${G}RUNNING${N} since $(systemctl show -p ActiveEnterTimestamp --value pzserver.service) · RAM ${mem}"
+  else
+    echo "  Server   : ${R}STOPPED${N}"
+  fi
+  echo "  Version  : ${PZ_BRANCH} (installed: ${INSTALLED_BRANCH:-none}) · memory limit ${XMX}"
+  echo "  Autostart: ${AUTOSTART} · auto-save every ${SAVE_MINUTES} min"
+  echo "  Network  : ${NETWORK_MODE}$( [[ $NETWORK_MODE == tailscale ]] && echo " · $(tailscale_ip || echo 'not connected')")"
+  local last; last=$(sudo ls -1t "$BACKUP_DIR"/pz-*.tar.gz 2>/dev/null | head -1)
+  echo "  Last backup: ${last:-none yet} · next: $(systemctl show -p NextElapseUSecRealtime --value pzbackup.timer 2>/dev/null)"
+  echo "  Disk free: $(df -h --output=avail /home | tail -1 | tr -d ' ')"
+  server_active && { echo; cmd_players; }
+}
+
+# =============================================================================
+#  Join card for friends
+# =============================================================================
+cmd_join() {
+  local ip note=""
+  if [[ $NETWORK_MODE == tailscale ]]; then
+    ip=$(tailscale_ip); [[ -z $ip ]] && ip="(Tailscale not connected — run Repair)"
+  else
+    ip=$(public_ip); [[ -z $ip ]] && ip="(could not detect — check internet)"
+    note="NOTE: Jio can change this IP after a router restart — check again each session."
+  fi
+  local state="${R}STOPPED${N}"; server_active && state="${G}RUNNING${N}"
+
+  local card
+  card=$(cat <<EOF
+================ PROJECT ZOMBOID — JOIN INFO ================
+
+ BEFORE YOU JOIN (Windows and Mac)
+  * Game version must be exactly: ${PZ_BRANCH}
+    (turn OFF auto-update in GOG Galaxy / Steam)
+  * Steam players: Library > Project Zomboid > Properties >
+    Launch Options:  -nosteam        (GOG players: nothing to do)
+$( [[ $NETWORK_MODE == tailscale ]] && cat <<EOT
+  * Install Tailscale: https://tailscale.com/download
+    Sign in, accept the host's share invite (email),
+    and keep Tailscale CONNECTED while playing.
+EOT
+)
+
+ IN THE GAME
+  Main Menu > JOIN > Add server (or "Favorites" > Add):
+
+    Server IP / Address : ${ip}
+    Port                : ${GAME_PORT}
+    Server password     : ${JOIN_PASSWORD}
+    Username            : pick your own
+    Account password    : pick your own (remember it!)
+
+  First join creates your account with that username/password.
+${note:+  $note
+}
+ HOST (playing on this laptop): IP 127.0.0.1, port ${GAME_PORT}
+==============================================================
+EOF
+)
+  echo; echo "$card"; echo "  Server right now: ${state}"
+  umask 077; printf '%s\n' "$card" >"$JOIN_CARD"
+  echo "${D}Saved to ${JOIN_CARD} — send it to your friends privately (it has the password).${N}"
+  if command -v wl-copy >/dev/null && [[ -n ${WAYLAND_DISPLAY:-} ]]; then
+    printf '%s\n' "$card" | wl-copy && echo "${D}Also copied to clipboard.${N}"
+  elif command -v xclip >/dev/null && [[ -n ${DISPLAY:-} ]]; then
+    printf '%s\n' "$card" | xclip -selection clipboard && echo "${D}Also copied to clipboard.${N}"
+  fi
+  [[ $NETWORK_MODE == tailscale ]] && tailscale_share_help
+  return 0
+}
+
+# =============================================================================
+#  Backups
+# =============================================================================
+cmd_backup() {
+  require_installed || return 1; sudo_start || return 1
+  info "Backing up the world…"
+  local ts; ts=$(date +%s)
+  sudo systemctl start pzbackup.service; local rc=$?
+  sudo journalctl -q -u pzbackup.service --since "@${ts}" -o cat --no-pager | tee -a "$LOG_FILE"
+  (( rc == 0 )) && ok "Backup done." || { LAST_ERROR="Backup"; on_fail; return 1; }
+}
+
+cmd_restore() {
+  require_installed || return 1; sudo_start || return 1
+  local files=() i n
+  mapfile -t files < <(sudo ls -1t "$BACKUP_DIR"/pz-*.tar.gz 2>/dev/null)
+  (( ${#files[@]} )) || { warn "No backups found in ${BACKUP_DIR}."; return 0; }
+  echo "${W}Backups (newest first):${N}"
+  for i in "${!files[@]}"; do echo "  $((i+1))) $(basename "${files[$i]}")"; done
+  n=$(ask "Restore which one (0 = cancel)" 0)
+  [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#files[@]} )) || { info "Cancelled."; return 0; }
+  local f=${files[$((n-1))]}
+  warn "This REPLACES the current world with $(basename "$f")."
+  ask_yn "Continue? (the current world is backed up first)" n || return 0
+  local was=no; server_active && was=yes
+  cmd_stop || return 1
+  cmd_backup || return 1
+  local keep="${ZOMBOID_DIR}/pre-restore-$(date +%F_%H%M%S)"
+  run as_pz bash -c "mkdir -p '$keep' && cd '$PZ_HOME' && for p in Zomboid/Saves/Multiplayer Zomboid/Server Zomboid/db; do [ -e \"\$p\" ] && mv \"\$p\" '$keep/'; done; mkdir -p Zomboid/Saves && tar xzf '$f'" \
+    || { LAST_ERROR="Restore backup"; on_fail; return 1; }
+  ok "Restored $(basename "$f"). Old world kept in ${keep}"
+  [[ $was == yes ]] && cmd_start
+}
+
+# =============================================================================
+#  Network check (Jio CGNAT)
+# =============================================================================
+cmd_netcheck() {
+  echo; echo "${W}── Network check ──${N}"
+  local lip gw pub wan
+  lip=$(local_ip); gw=$(gateway_ip); pub=$(public_ip)
+  echo "  This laptop (LAN) : ${lip:-?}"
+  echo "  Router            : ${gw:-?}"
+  echo "  Public IP (seen by internet): ${pub:-could not detect}"
+  if [[ -n $pub ]] && is_cgnat_ip "$pub"; then
+    warn "Your public IP is in the CGNAT range — port forwarding will NOT work. Use Tailscale."
+    return 0
+  fi
+  echo
+  echo "  Open ${C}http://${gw:-192.168.29.1}${N} in a browser, log in, and find the"
+  echo "  ${W}WAN IPv4${N} / Internet IP on the status page."
+  wan=$(ask "  Type that WAN IPv4 here (Enter to skip)" "")
+  log INFO "netcheck: wan_entered=$([[ -n $wan ]] && echo yes || echo no)"
+  if [[ -z $wan ]]; then
+    info "Skipped. If friends can't connect with port forwarding, switch to Tailscale in Settings."
+  elif [[ $wan == "$pub" ]]; then
+    ok "WAN IP matches public IP — you have a real public IP. Port forwarding can work."
+    cat <<EOF
+
+  ${W}Router port forwarding:${N}
+   1. Router page → LAN / DHCP → reserve ${lip:-the laptop IP} for this laptop
+   2. Router page → NAT / Security → Port Forwarding (name varies), add:
+        UDP ${GAME_PORT} → ${lip:-LAN IP}:${GAME_PORT}
+        UDP ${UDP_PORT} → ${lip:-LAN IP}:${UDP_PORT}
+   3. Friends use the public IP: ${pub}
+EOF
+  elif is_private_ip "$wan"; then
+    warn "Router's WAN IP ($wan) is private → Jio CGNAT. Port forwarding will NOT work. Use Tailscale."
+  else
+    warn "WAN IP differs from public IP → CGNAT. Port forwarding will NOT work. Use Tailscale."
+  fi
+}
+
+# =============================================================================
+#  Settings / update
+# =============================================================================
+apply_change_restart() {
+  if server_active && ask_yn "Restart server now to apply?" y; then cmd_restart; fi
+}
+
+cmd_settings() {
+  require_installed || return 1; ensure_permission || return 1
+  while :; do
+    echo; echo "${W}── Settings ──${N}"
+    echo "  1) Join password for friends   (current: set)"
+    echo "  2) Server memory               (current: ${XMX})"
+    echo "  3) Auto-save interval          (current: ${SAVE_MINUTES} min)"
+    echo "  4) Game version                (current: ${PZ_BRANCH})"
+    echo "  5) Start on boot               (current: ${AUTOSTART})"
+    echo "  6) Network mode                (current: ${NETWORK_MODE})"
+    echo "  7) List available game versions from Steam"
+    echo "  0) Back"
+    case $(ask "Choose" 0) in
+      1) JOIN_PASSWORD=$(ask_secret "New join password"); save_config; configure_ini && ok "Updated."; apply_change_restart ;;
+      2) XMX=$(ask "Server memory (e.g. 6g, 8g)" "$XMX"); save_config; set_xmx; apply_change_restart ;;
+      3) SAVE_MINUTES=$(ask "Auto-save every N minutes" "$SAVE_MINUTES"); save_config; configure_ini && ok "Updated."; apply_change_restart ;;
+      4) PZ_BRANCH=$(ask "Game version / branch" "$PZ_BRANCH"); save_config; cmd_update_server ;;
+      5) if ask_yn "Start server automatically on boot?" n; then AUTOSTART=yes; sudo systemctl enable pzserver.service; else AUTOSTART=no; sudo systemctl disable pzserver.service; fi; save_config; ok "Saved." ;;
+      6) local m; m=$(ask "1) Tailscale  2) Port forwarding" 1)
+         [[ $m == 2 ]] && NETWORK_MODE=portforward || NETWORK_MODE=tailscale; save_config
+         step "Install packages" install_packages && step "Firewall" firewall_open && step "Network" network_setup || on_fail ;;
+      7) show_branches ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+cmd_update_server() {
+  require_installed || return 1; ensure_permission || return 1
+  warn "All 4 friends must switch to the same game version (${PZ_BRANCH}) too."
+  local was=no; server_active && was=yes
+  [[ $was == yes ]] && { cmd_stop || return 1; }
+  step "Update server files" install_server force && step "Re-apply memory setting" set_xmx || { on_fail; return 1; }
+  ok "Server is on version ${PZ_BRANCH}."
+  [[ $was == yes ]] && cmd_start
+}
+
+source_dir() { cat "${CONF_DIR}/source_dir" 2>/dev/null; }
+
+update_available() {
+  local src; src=$(source_dir)
+  [[ -d $src/.git ]] || return 1
+  timeout 6 git -C "$src" fetch -q 2>/dev/null || return 1
+  [[ $(git -C "$src" rev-parse HEAD) != "$(git -C "$src" rev-parse '@{u}' 2>/dev/null)" ]]
+}
+
+cmd_self_update() {
+  local src; src=$(source_dir)
+  [[ -d $src/.git ]] || { err "App source folder not found (${src:-unknown}). Re-clone the repo and run install.sh."; return 1; }
+  info "Updating app from GitHub…"
+  run git -C "$src" pull --ff-only || { LAST_ERROR="Update app"; on_fail; return 1; }
+  run bash "$src/install.sh" --no-launch || { LAST_ERROR="Update app"; on_fail; return 1; }
+  ok "App updated to $(git -C "$src" log -1 --format='%h %s')"
+  if [[ $INSTALLED == yes ]] && ask_yn "Re-apply server settings with the new version (Repair)?" y; then
+    exec /usr/local/bin/pzhost setup
+  fi
+  exec /usr/local/bin/pzhost
+}
+
+cmd_uninstall() {
+  ensure_permission || return 1
+  warn "This removes the services, power and firewall changes made by pzhost."
+  ask_yn "Continue?" n || return 0
+  server_active && cmd_stop
+  sudo systemctl disable --now pzserver.service pzbackup.timer pzrestart.timer 2>/dev/null
+  sudo rm -f "${UNIT_DIR}"/pzserver.{service,socket} "${UNIT_DIR}"/pzbackup.{service,timer} "${UNIT_DIR}"/pzrestart.{service,timer}
+  sudo rm -rf "${UNIT_DIR}/pzserver.service.d" "$LIB_DIR"
+  sudo systemctl daemon-reload
+  sudo rm -f "$SYSCTL_FILE" "$NM_WIFI_CONF"; sudo systemctl reload NetworkManager 2>/dev/null
+  sudo rm -f "$LOGIND_DROPIN"; sudo systemctl unmask "${SLEEP_TARGETS[@]}"; sudo systemctl kill -s HUP systemd-logind 2>/dev/null
+  if command -v ufw >/dev/null; then
+    sudo ufw delete allow "${GAME_PORT}:${UDP_PORT}/udp" >/dev/null 2>&1
+    sudo ufw delete allow in on tailscale0 >/dev/null 2>&1
+    sudo ufw delete allow "${TS_PORT}/udp" >/dev/null 2>&1
+  fi
+  if systemctl is-active -q firewalld; then
+    sudo firewall-cmd --permanent --remove-port="${GAME_PORT}-${UDP_PORT}/udp" >/dev/null 2>&1
+    sudo firewall-cmd --permanent --zone=trusted --remove-interface=tailscale0 >/dev/null 2>&1
+    sudo firewall-cmd --permanent --remove-port="${TS_PORT}/udp" >/dev/null 2>&1
+    sudo firewall-cmd --reload >/dev/null 2>&1
+  fi
+  ok "Services, power, network tuning and firewall changes removed."
+  if ask_yn "ALSO delete the server files AND THE WORLD in ${PZ_HOME}? (cannot be undone)" n; then
+    local copy="${HOME}/zomboid-world-backup-$(date +%F_%H%M).tar.gz"
+    info "Saving a copy of the world to ${copy} first…"
+    sudo tar czf "$copy" -C "$PZ_HOME" Zomboid backups 2>/dev/null; sudo chown "$(id -u):$(id -g)" "$copy"
+    sudo userdel -r "$PZ_USER" && ok "Server user and files deleted."
+  fi
+  INSTALLED=no; INSTALLED_BRANCH=""; PERMISSION_GRANTED=no; save_config
+  ok "Uninstalled. The app itself stays (remove: sudo rm /usr/local/bin/pzhost)."
+}
+
+# =============================================================================
+#  Error report → GitHub issue
+# =============================================================================
+redact() {  # redact FILE
+  local f=$1 s
+  for s in "$JOIN_PASSWORD" "$ADMIN_PASSWORD" "${PUBLIC_IP_CACHE:-}"; do
+    [[ -n $s ]] && sed -i "s/${s//./\\.}/[REDACTED]/g" "$f"
+  done
+  sed -E -i \
+    -e 's/\x1b\[[0-9;]*m//g' \
+    -e 's/(Password=).*/\1[REDACTED]/' \
+    -e 's/(-adminpassword )[^ "]+/\1[REDACTED]/g' \
+    -e 's/(gh[opsu]_)[A-Za-z0-9]+/\1[REDACTED]/g' \
+    -e 's/(PASSWORD=).*/\1[REDACTED]/' "$f"
+}
+
+on_fail() {
+  echo
+  err "Something went wrong at: ${LAST_ERROR:-unknown step}"
+  echo "  Full log: ${LOG_FILE}"
+  if [[ -t 0 ]] && ask_yn "Send an error report to GitHub so it can be fixed?" y; then
+    cmd_report
+  else
+    echo "  You can send it later from the menu: ${W}Send error report${N} (or: pzhost report)"
+  fi
+}
+
+section() {  # section "Title" cmd... — fenced output block for the report
+  printf '\n### %s\n~~~text\n' "$1"
+  shift
+  "$@" 2>&1 | tail -n 400
+  printf '~~~\n'
+}
+
+cmd_report() {
+  sudo -n true 2>/dev/null || sudo_start || true
+  local desc f title
+  echo; echo "${W}Error report${N} — passwords and your public IP are removed automatically."
+  desc=$(ask "In a few words: what were you doing / what went wrong?" "")
+  PUBLIC_IP_CACHE=$(public_ip)
+  f="${STATE_DIR}/report-$(date +%F_%H%M%S).md"
+  {
+    echo "## pzhost error report"
+    echo "- **App version:** ${PZHOST_VERSION} ($(git -C "$(source_dir)" log -1 --format='%h %cd' --date=short 2>/dev/null || echo 'no git'))"
+    echo "- **Date:** $(date '+%F %T %Z')"
+    echo "- **Failed step:** ${LAST_ERROR:-none (manual report)}"
+    echo "- **User says:** ${desc:-(nothing)}"
+    section "System" bash -c '. /etc/os-release; echo "$PRETTY_NAME"; uname -a; echo; lscpu | grep -E "Model name|^CPU\(s\)"; echo; free -h; echo; df -h /home /'
+    section "pzhost config (passwords redacted)" cat "$CONF"
+    section "Services" bash -c 'systemctl --no-pager status pzserver.service pzserver.socket pzbackup.timer pzrestart.timer 2>&1 | head -60; echo; systemctl list-timers --no-pager "pz*"'
+    section "Server files" sudo -n bash -c "ls -la '${PZ_HOME}' '${SERVER_DIR}' 2>&1 | head -60; echo; grep -o '\"-Xm[sx][^\"]*\"' '${SERVER_DIR}/ProjectZomboid64.json' 2>&1"
+    section "Server ini (passwords redacted)" sudo -n grep -E '^(Public|Password|MaxPlayers|DefaultPort|UDPPort|SaveWorldEveryMinutes|Backups|Mods|WorkshopItems|Map)' "${ZOMBOID_DIR}/Server/${SERVER_NAME}.ini"
+    section "Firewall" bash -c 'command -v ufw >/dev/null && sudo -n ufw status verbose; systemctl is-active firewalld >/dev/null 2>&1 && sudo -n firewall-cmd --list-all; true'
+    section "Network" bash -c "echo mode=${NETWORK_MODE}; ip -4 -br addr; echo; command -v tailscale >/dev/null && tailscale status --peers=false 2>&1; true"
+    section "Ping check" cmd_pingcheck
+    section "Network tuning" bash -c "cat '${SYSCTL_FILE}' '${NM_WIFI_CONF}' 2>&1"
+    section "Power / sleep" bash -c "cat '${LOGIND_DROPIN}' 2>&1; systemctl is-enabled ${SLEEP_TARGETS[*]} 2>&1"
+    section "pzhost log (last 300 lines)" tail -n 300 "$LOG_FILE"
+    section "Server journal (last 250 lines)" sudo -n journalctl -u pzserver.service -n 250 --no-pager -o short-iso
+    section "Server console.txt (last 150 lines)" sudo -n tail -n 150 "${ZOMBOID_DIR}/server-console.txt"
+    section "Backup journal (last 30 lines)" sudo -n journalctl -u pzbackup.service -n 30 --no-pager -o short-iso
+  } >"$f" 2>&1
+  redact "$f"
+  # GitHub issue bodies are limited to 65536 characters.
+  if (( $(wc -c <"$f") > 60000 )); then
+    head -c 60000 "$f" >"$f.tmp" && printf '\n~~~\n\n_(report truncated — full file kept on the host at %s)_\n' "$f" >>"$f.tmp" && mv "$f.tmp" "$f.body"
+  else
+    cp "$f" "$f.body"
+  fi
+  log INFO "report written: $f"
+  ok "Report saved: $f"
+
+  title="Error report: ${LAST_ERROR:-manual} ($(date +%F))"
+  if ! command -v gh >/dev/null; then
+    report_fallback "$f"; return 0
+  fi
+  if ! gh auth status >/dev/null 2>&1; then
+    warn "GitHub CLI is not logged in."
+    if ask_yn "Log in to GitHub now (opens a browser code)?" y; then gh auth login --hostname github.com --git-protocol https --web || { report_fallback "$f"; return 0; }
+    else report_fallback "$f"; return 0; fi
+  fi
+  info "Creating GitHub issue on ${REPO}…"
+  local url
+  url=$(gh issue create --repo "$REPO" --title "$title" --body-file "$f.body" --label error-report 2>>"$LOG_FILE") \
+    || url=$(gh issue create --repo "$REPO" --title "$title" --body-file "$f.body" 2>>"$LOG_FILE")
+  if [[ -n $url ]]; then
+    ok "Report sent: ${url}"
+    log INFO "report sent: $url"
+    echo "  When it's fixed, choose ${W}Update this app${N} in the menu."
+  else
+    err "Could not create the issue (no access to ${REPO}?)."
+    report_fallback "$f"
+  fi
+}
+
+report_fallback() {
+  cat <<EOF
+
+  Send the report manually:
+   1. Open ${C}https://github.com/${REPO}/issues/new${N}
+   2. Title: "Error report"
+   3. Drag this file into the text box: ${W}$1${N}
+EOF
+}
+
+# =============================================================================
+#  Menu
+# =============================================================================
+header() {
+  clear 2>/dev/null
+  local st="${R}● STOPPED${N}"; server_active && st="${G}● RUNNING${N}"
+  [[ $INSTALLED != yes ]] && st="${Y}● NOT INSTALLED${N}"
+  echo "${W}┌──────────────────────────────────────────────────────┐${N}"
+  printf '%s│  🧟 Zomboid Host  v%-8s  Server: %s%s\n' "$W" "$PZHOST_VERSION" "$st" "$N"
+  echo "${W}└──────────────────────────────────────────────────────┘${N}"
+  [[ ${UPDATE_FLAG:-} == yes ]] && echo "${Y}  ⬆ An app update is available — choose 15) Update this app${N}"
+}
+
+menu() {
+  UPDATE_FLAG=no; update_available && UPDATE_FLAG=yes
+  while :; do
+    load_config
+    header
+    if [[ $INSTALLED != yes ]]; then
+      cat <<EOF
+
+  1) ${W}Set up the server (first time)${N}
+  2) Network check (does Jio allow port forwarding?)
+  5) Ping check
+  3) Send error report to GitHub
+  4) Update this app
+  0) Quit
+EOF
+      case $(ask "Choose" 1) in
+        1) cmd_setup ;; 2) cmd_netcheck ;; 3) cmd_report ;; 4) cmd_self_update ;; 5) cmd_pingcheck ;; 0|q) exit 0 ;;
+      esac
+      pause; continue
+    fi
+    cat <<EOF
+
+  ${W}Server${N}                          ${W}World${N}
+   1) Start                          7) Save now
+   2) Stop                           8) Backup now
+   3) Restart                        9) Restore a backup
+   4) ${W}Join info for friends${N}
+   5) Status & players            ${W}Help / maintenance${N}
+   6) Message all players           10) Live server log
+                                    11) Settings
+                                    12) Network check
+                                    13) Update game version
+                                    14) Send error report
+                                    15) Update this app
+                                    16) Repair (re-run setup)
+                                    17) Uninstall
+                                    18) ${W}Ping check${N}
+   0) Quit
+EOF
+    case $(ask "Choose" 4) in
+      1) cmd_start ;; 2) cmd_stop ;; 3) cmd_restart ;; 4) cmd_join ;; 5) cmd_status ;;
+      6) cmd_say ;; 7) cmd_save ;; 8) cmd_backup ;; 9) cmd_restore ;; 10) cmd_logs ;;
+      11) cmd_settings ;; 12) cmd_netcheck ;; 13) cmd_update_server ;; 14) cmd_report ;;
+      15) cmd_self_update ;; 16) cmd_setup ;; 17) cmd_uninstall ;; 18) cmd_pingcheck ;; 0|q) exit 0 ;;
+      *) warn "Unknown choice." ;;
+    esac
+    pause
+  done
+}
+
+usage() {
+  cat <<EOF
+pzhost ${PZHOST_VERSION} — Project Zomboid server manager for CachyOS
+
+  pzhost                 interactive menu
+  pzhost setup           install / repair everything (asks permission first)
+  pzhost start|stop|restart
+  pzhost join            show + save join info for friends
+  pzhost status          status, players, backups
+  pzhost players         list online players
+  pzhost say "text"      message all players
+  pzhost save            save world now
+  pzhost backup          backup now
+  pzhost restore         restore a backup
+  pzhost logs            live server log
+  pzhost settings        change passwords, memory, version, network
+  pzhost netcheck        Jio CGNAT / port forwarding check
+  pzhost ping            ping / Wi-Fi / Tailscale direct-vs-relay check
+  pzhost update-server   change/update the game server version
+  pzhost report          send an error report to GitHub
+  pzhost self-update     update this app from GitHub
+  pzhost uninstall       undo everything
+  pzhost version
+EOF
+}
+
+main() {
+  if [[ $EUID -eq 0 ]]; then
+    echo "Run pzhost as your normal user (not root / not with sudo). It asks for your password when needed." >&2
+    exit 1
+  fi
+  load_config
+  log INFO "──── pzhost ${PZHOST_VERSION} started: ${*:-menu} (user $(id -un))"
+  local cmd=${1:-menu}; shift || true
+  case $cmd in
+    menu)          menu ;;
+    setup|repair)  cmd_setup ;;
+    start)         cmd_start ;;
+    stop)          cmd_stop ;;
+    restart)       cmd_restart ;;
+    join|info)     cmd_join ;;
+    status)        cmd_status ;;
+    players)       cmd_players ;;
+    say|msg)       cmd_say "$*" ;;
+    save)          cmd_save ;;
+    backup)        cmd_backup ;;
+    restore)       cmd_restore ;;
+    logs|log)      cmd_logs ;;
+    settings)      cmd_settings ;;
+    netcheck)      cmd_netcheck ;;
+    ping|pingcheck) cmd_pingcheck ;;
+    update-server) cmd_update_server ;;
+    report)        cmd_report ;;
+    self-update|update) cmd_self_update ;;
+    uninstall)     cmd_uninstall ;;
+    version|-v|--version) echo "pzhost ${PZHOST_VERSION}" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
