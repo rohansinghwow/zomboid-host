@@ -50,6 +50,7 @@ Next time, open **Zomboid Host** from the app menu / desktop icon, or type `pzho
 | See who's online | 5 |
 | Save right now | 7 |
 | Check ping / Wi-Fi / Tailscale direct vs relay | **18) Ping check** |
+| Change zombies, loot, XP, day length (has a **Beginner** preset) | **19) Gameplay settings** |
 | Something broke | **14) Send error report** |
 | Get the fix | **15) Update this app** |
 
@@ -81,6 +82,7 @@ The host sends you the join info. In short:
 | UDP 16261-16262 (+41641 Tailscale) in ufw/firewalld | friends can connect | uninstall |
 | `/etc/sysctl.d/90-pzhost.conf`, Wi-Fi power-save off, server `Nice=-5`, performance profile while running | lower, steadier ping | uninstall |
 | `servertest.ini`: private, password, auto-save every 10 min, built-in backups | safety | settings |
+| `servertest_SandboxVars.lua`: only if you use **19) Gameplay settings** (old file kept as `.bak-<date>`) | difficulty | gameplay settings |
 
 Everything is reverted with **17) Uninstall** (`pzhost uninstall`). The world is only deleted if you
 explicitly say so, and a copy is saved to your home folder first.
@@ -105,6 +107,7 @@ pzhost say "text"      message all players
 pzhost save|backup|restore
 pzhost ping            ping / Wi-Fi / Tailscale check
 pzhost netcheck        Jio CGNAT check
+pzhost gameplay        zombies / loot / XP / beginner preset
 pzhost settings|update-server|report|self-update|uninstall
 ```
 

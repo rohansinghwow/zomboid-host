@@ -8,7 +8,7 @@
 #          pzhost help       (list all commands)
 # =============================================================================
 
-PZHOST_VERSION="1.1.0"
+PZHOST_VERSION="1.2.0"
 REPO="rohansinghwow/zomboid-host"
 
 # ---- fixed paths -------------------------------------------------------------
@@ -1018,6 +1018,7 @@ cmd_settings() {
     echo "  5) Start on boot               (current: ${AUTOSTART})"
     echo "  6) Network mode                (current: ${NETWORK_MODE})"
     echo "  7) List available game versions from Steam"
+    echo "  8) ${W}Gameplay settings${N} (zombies, loot, XP, day length…)"
     echo "  0) Back"
     case $(ask "Choose" 0) in
       1) JOIN_PASSWORD=$(ask_secret "New join password"); save_config; configure_ini && ok "Updated."; apply_change_restart ;;
@@ -1029,8 +1030,262 @@ cmd_settings() {
          [[ $m == 2 ]] && NETWORK_MODE=portforward || NETWORK_MODE=tailscale; save_config
          step "Install packages" install_packages && step "Firewall" firewall_open && step "Network" network_setup || on_fail ;;
       7) show_branches ;;
+      8) cmd_gameplay ;;
       *) return 0 ;;
     esac
+  done
+}
+
+# =============================================================================
+#  Gameplay (sandbox) settings — servertest_SandboxVars.lua
+#  Only keys that already exist in the file are changed, so this keeps working
+#  if a game update renames or moves an option (it is simply skipped).
+# =============================================================================
+sandbox_file() { echo "${ZOMBOID_DIR}/Server/${SERVER_NAME}_SandboxVars.lua"; }
+
+# sb_awk get|set TABLE KEY [VALUE] < file
+#   TABLE "" = any table, otherwise the innermost table must have that name.
+#   KEY "*Suffix" matches every key ending in Suffix (e.g. *LootNew).
+#   get prints the first value; set prints the whole file. Exit 3 = key not found.
+sb_awk() {
+  awk -v mode="$1" -v sect="$2" -v key="$3" -v val="${4:-}" '
+    BEGIN {
+      d = 0; n = 0
+      if (substr(key, 1, 1) == "*") re = "^[ \t]*[A-Za-z0-9_]*" substr(key, 2) "[ \t]*=[ \t]*"
+      else re = "^[ \t]*" key "[ \t]*=[ \t]*"
+    }
+    {
+      line = $0
+      if (line ~ /=[ \t]*\{[ \t]*$/) {
+        nm = line; sub(/^[ \t]*/, "", nm); sub(/[ \t]*=.*$/, "", nm); st[++d] = nm
+        if (mode == "set") print line
+        next
+      }
+      if (line ~ /^[ \t]*\},?[ \t]*$/) { if (d > 0) d--; if (mode == "set") print line; next }
+      if ((sect == "" || (d > 0 && st[d] == sect)) && match(line, re)) {
+        pre = substr(line, 1, RLENGTH); rest = substr(line, RLENGTH + 1)
+        v = rest; sub(/,?[ \t]*$/, "", v)
+        n++
+        if (mode == "get" && n == 1) print v
+        if (mode == "set") line = pre val ((rest ~ /,[ \t]*$/) ? "," : "")
+      }
+      if (mode == "set") print line
+    }
+    END { exit (n > 0 ? 0 : 3) }'
+}
+
+GP_TMP=""; GP_DIRTY=no; GP_SKIPPED=()
+gp_get() { sb_awk get "$1" "$2" <"$GP_TMP"; }
+gp_set() {  # gp_set TABLE KEY VALUE — edit the working copy; returns 1 if the key isn't in this game version
+  local out
+  if out=$(sb_awk set "$1" "$2" "$3" <"$GP_TMP"); then
+    printf '%s\n' "$out" >"$GP_TMP"; GP_DIRTY=yes; log INFO "gameplay: ${1:+$1.}$2 = $3"; return 0
+  fi
+  GP_SKIPPED+=("$2"); log WARN "gameplay: key $2 not found in sandbox file — skipped"; return 1
+}
+gp_has() { gp_get "$1" "$2" >/dev/null; }
+
+# --- one function per option: set + human-readable label ---------------------
+gp_pop_set() {  # multiplier
+  local m=$1 z
+  z=$(awk -v m="$m" 'BEGIN{print (m==0)?6:(m<=0.45)?5:(m<=0.9)?4:(m<=1.3)?3:(m<=1.8)?2:1}')
+  gp_set "" PopulationMultiplier "$m"
+  gp_has SandboxVars Zombies && gp_set SandboxVars Zombies "$z"
+}
+gp_pop_label() {
+  local v; v=$(gp_get "" PopulationMultiplier) || { echo "?"; return; }
+  awk -v m="$v" 'BEGIN{l=(m==0)?"None":(m<=0.2)?"Very few":(m<=0.45)?"Few":(m<=0.9)?"Normal":(m<=1.3)?"Many":(m<=1.8)?"Very many":"Insane"; printf "%s (%sx)", l, m}'
+}
+gp_speed_label() {
+  case $(gp_get ZombieLore Speed) in
+    1) echo "Sprinters (very hard)" ;; 2) echo "Fast shamblers (normal)" ;;
+    3) echo "Shamblers / slow (easiest)" ;; 4) echo "Random mix" ;; *) echo "?" ;;
+  esac
+}
+gp_strength_label() {
+  case $(gp_get ZombieLore Strength) in
+    1) echo "Superhuman (hard)" ;; 2) echo "Normal" ;; 3) echo "Weak (easier)" ;; *) echo "?" ;;
+  esac
+}
+gp_infect_label() {
+  case $(gp_get ZombieLore Transmission) in
+    1) echo "Bites + scratches can infect (normal)" ;; 2) echo "Only bites infect (easier)" ;;
+    3) echo "Everyone is already infected" ;; 4) echo "Never infected (easiest)" ;; *) echo "?" ;;
+  esac
+}
+gp_day_label() {
+  local v; v=$(gp_get "" DayLength)
+  case $v in
+    1) echo "15 min" ;; 2) echo "30 min" ;; 3) echo "1 hour (normal)" ;; 4) echo "1.5 hours" ;;
+    5) echo "2 hours" ;; 6) echo "3 hours" ;; 7) echo "4 hours" ;; "") echo "?" ;; *) echo "custom (${v})" ;;
+  esac
+}
+gp_xp_set() {  # Build 42: MultiplierConfig.Global, Build 41: XpMultiplier
+  local done=no
+  if gp_has MultiplierConfig Global; then
+    gp_set MultiplierConfig Global "$1" && done=yes
+    gp_has MultiplierConfig GlobalToggle && gp_set MultiplierConfig GlobalToggle true
+  fi
+  if gp_has "" XpMultiplier; then gp_set "" XpMultiplier "$1" && done=yes; fi
+  [[ $done == yes ]] || GP_SKIPPED+=("XP")
+}
+gp_xp_label() {
+  local v; v=$(gp_get MultiplierConfig Global) || v=$(gp_get "" XpMultiplier) || { echo "?"; return; }
+  echo "${v}x"
+}
+gp_loot_set() { gp_set "" "*LootNew" "$1"; }
+gp_loot_label() {
+  local v; v=$(gp_get "" "*LootNew") || { echo "?"; return; }
+  awk -v m="$v" 'BEGIN{l=(m<=0.35)?"Rare":(m<=0.8)?"Normal":(m<=1.5)?"Plenty":"Lots"; printf "%s (%sx)", l, m}'
+}
+gp_utils_set() { gp_set "" WaterShutModifier "$1"; gp_set "" ElecShutModifier "$1"; }
+gp_utils_label() { local v; v=$(gp_get "" WaterShutModifier) || { echo "?"; return; }; echo "about ${v} days"; }
+gp_night_label() {
+  case $(gp_get "" NightDarkness) in
+    1) echo "Pitch black" ;; 2) echo "Dark" ;; 3) echo "Normal" ;; 4) echo "Bright (easier)" ;; *) echo "?" ;;
+  esac
+}
+gp_injury_label() {
+  case $(gp_get "" InjurySeverity) in
+    1) echo "Low (easier)" ;; 2) echo "Normal" ;; 3) echo "High" ;; *) echo "?" ;;
+  esac
+}
+gp_kit_label() { case $(gp_get "" StarterKit) in true) echo "Yes" ;; false) echo "No" ;; *) echo "?" ;; esac; }
+gp_points_label() { local v; v=$(gp_get "" CharacterFreePoints) || { echo "?"; return; }; echo "+${v}"; }
+
+gp_preset() {
+  case $1 in
+    beginner)
+      gp_pop_set 0.35; gp_set ZombieLore Speed 3; gp_set ZombieLore Strength 3; gp_set ZombieLore Toughness 3
+      gp_set ZombieLore Transmission 2; gp_set "" DayLength 4; gp_xp_set 2.0; gp_loot_set 1.0
+      gp_utils_set 90; gp_set "" NightDarkness 3; gp_set "" InjurySeverity 1; gp_set "" StarterKit true
+      gp_set "" CharacterFreePoints 4 ;;
+    normal)
+      gp_pop_set 0.65; gp_set ZombieLore Speed 2; gp_set ZombieLore Strength 2; gp_set ZombieLore Toughness 2
+      gp_set ZombieLore Transmission 1; gp_set "" DayLength 3; gp_xp_set 1.0; gp_loot_set 0.6
+      gp_utils_set 14; gp_set "" NightDarkness 3; gp_set "" InjurySeverity 2; gp_set "" StarterKit false
+      gp_set "" CharacterFreePoints 0 ;;
+    hard)
+      gp_pop_set 1.2; gp_set ZombieLore Speed 2; gp_set ZombieLore Strength 2; gp_set ZombieLore Toughness 2
+      gp_set ZombieLore Transmission 1; gp_set "" DayLength 3; gp_xp_set 1.0; gp_loot_set 0.4
+      gp_utils_set 7; gp_set "" NightDarkness 2; gp_set "" InjurySeverity 3; gp_set "" StarterKit false
+      gp_set "" CharacterFreePoints 0 ;;
+  esac
+}
+
+gp_pick() {  # gp_pick "Title" "label1" "label2" … → prints chosen number (empty = keep)
+  local title=$1 i=1 o; shift
+  echo >&2; echo "  ${W}${title}${N}" >&2
+  for o in "$@"; do echo "    ${i}) ${o}" >&2; ((i++)); done
+  local c; c=$(ask "  Choose (Enter = keep current)" "")
+  [[ $c =~ ^[0-9]+$ ]] && (( c >= 1 && c <= $# )) && echo "$c"
+}
+
+gp_save() {
+  local f; f=$(sandbox_file)
+  local was=no; server_active && was=yes
+  if [[ $was == yes ]]; then
+    warn "The server must restart to use the new settings (players will be kicked for ~1 minute)."
+    ask_yn "Restart the server now?" y || { info "Not saved. Nothing changed."; return 1; }
+    cmd_stop || return 1
+  fi
+  as_pz cp "$f" "${f}.bak-$(date +%F-%H%M%S)" || { err "Could not back up the settings file."; return 1; }
+  as_pz tee "$f" <"$GP_TMP" >/dev/null || { err "Could not write the settings file."; return 1; }
+  ok "Gameplay settings saved (old file kept as ${f##*/}.bak-…)."
+  if [[ $was == yes ]]; then cmd_start
+  else info "They will be used the next time you start the server."; fi
+}
+
+cmd_gameplay() {
+  require_installed || return 1; ensure_permission || return 1
+  local f; f=$(sandbox_file)
+  if ! as_pz test -f "$f"; then
+    err "Gameplay settings file not found: $f"
+    info "Run 16) Repair once so the server creates its world, then try again."
+    return 1
+  fi
+  GP_TMP=$(mktemp "${STATE_DIR}/sandbox.XXXXXX") || return 1
+  as_pz cat "$f" >"$GP_TMP" || { err "Could not read $f"; rm -f "$GP_TMP"; return 1; }
+  GP_DIRTY=no
+  local c
+  while :; do
+    GP_SKIPPED=()
+    echo; echo "${W}── Gameplay settings ──${N}  $( [[ $GP_DIRTY == yes ]] && echo "${Y}(unsaved changes)${N}")"
+    cat <<EOF
+  ${D}New to Project Zomboid? Pick 1) Beginner — you can change single options after.${N}
+
+  ${W}Quick presets${N}
+   1) ${G}Beginner${N}  few slow weak zombies, only bites infect, 2x XP, more loot,
+                 longer days, water/power stay on ~3 months, starter bag, +4 trait points
+   2) Normal    the game's standard "Apocalypse" settings
+   3) Hard      more zombies, less loot, darker nights, power/water off after a week
+
+  ${W}Change one thing${N}                       ${D}current${N}
+   4) How many zombies                    $(gp_pop_label)
+   5) Zombie speed                        $(gp_speed_label)
+   6) Zombie strength / toughness         $(gp_strength_label)
+   7) Infection                           $(gp_infect_label)
+   8) Length of one in-game day           $(gp_day_label)
+   9) Skill learning speed (XP)           $(gp_xp_label)
+  10) Amount of loot                      $(gp_loot_label)
+  11) Water & electricity stay on for     $(gp_utils_label)
+  12) Night darkness                      $(gp_night_label)
+  13) Injury severity                     $(gp_injury_label)
+  14) Starter bag on spawn                $(gp_kit_label)
+  15) Extra trait points for characters   $(gp_points_label)
+
+   ${W}s) Save and apply${N}          0) Back
+  ${D}Note: loot changes only fill containers nobody has opened yet. Water/power
+  can't come back once they have already shut off in your world.${N}
+EOF
+    local p=""
+    c=$(ask "Choose" 0)
+    case $c in
+      1) gp_preset beginner; ok "Beginner preset ready — choose ${W}s${N} to save." ;;
+      2) gp_preset normal;   ok "Normal preset ready — choose ${W}s${N} to save." ;;
+      3) gp_preset hard;     ok "Hard preset ready — choose ${W}s${N} to save." ;;
+      4) p=$(gp_pick "How many zombies?" "None (just exploring / building)" "Very few" \
+               "Few ${G}(recommended for beginners)${N}" "Normal" "Many" "Very many" "Insane")
+         case $p in 1) gp_pop_set 0 ;; 2) gp_pop_set 0.15 ;; 3) gp_pop_set 0.35 ;; 4) gp_pop_set 0.65 ;;
+                    5) gp_pop_set 1.2 ;; 6) gp_pop_set 1.6 ;; 7) gp_pop_set 2.5 ;; esac ;;
+      5) p=$(gp_pick "Zombie speed?" "Sprinters (very hard)" "Fast shamblers (normal)" \
+               "Shamblers / slow ${G}(recommended for beginners)${N}" "Random mix")
+         [[ -n $p ]] && gp_set ZombieLore Speed "$p" ;;
+      6) p=$(gp_pick "Zombie strength and toughness?" "Superhuman (hard)" "Normal" \
+               "Weak ${G}(recommended for beginners)${N}")
+         [[ -n $p ]] && { gp_set ZombieLore Strength "$p"; gp_set ZombieLore Toughness "$p"; } ;;
+      7) p=$(gp_pick "How does infection work?" "Bites + scratches can infect (normal)" \
+               "Only bites infect ${G}(recommended for beginners)${N}" \
+               "Everyone is already infected (you turn when you die)" "Never infected (easiest)")
+         [[ -n $p ]] && gp_set ZombieLore Transmission "$p" ;;
+      8) p=$(gp_pick "How long is one in-game day (real time)?" "30 min" "1 hour (normal)" \
+               "1.5 hours ${G}(recommended for beginners)${N}" "2 hours" "3 hours")
+         case $p in 1) gp_set "" DayLength 2 ;; 2) gp_set "" DayLength 3 ;; 3) gp_set "" DayLength 4 ;;
+                    4) gp_set "" DayLength 5 ;; 5) gp_set "" DayLength 6 ;; esac ;;
+      9) p=$(gp_pick "How fast do skills level up?" "1x (normal)" "2x ${G}(recommended for beginners)${N}" "3x" "5x")
+         case $p in 1) gp_xp_set 1.0 ;; 2) gp_xp_set 2.0 ;; 3) gp_xp_set 3.0 ;; 4) gp_xp_set 5.0 ;; esac ;;
+     10) p=$(gp_pick "How much loot?" "Rare (hard)" "Normal" "Plenty ${G}(recommended for beginners)${N}" "Lots")
+         case $p in 1) gp_loot_set 0.3 ;; 2) gp_loot_set 0.6 ;; 3) gp_loot_set 1.0 ;; 4) gp_loot_set 2.0 ;; esac ;;
+     11) p=$(gp_pick "Water & electricity stay on for about…" "1 week (hard)" "2 weeks (normal)" \
+               "3 months ${G}(recommended for beginners)${N}" "1 year")
+         case $p in 1) gp_utils_set 7 ;; 2) gp_utils_set 14 ;; 3) gp_utils_set 90 ;; 4) gp_utils_set 365 ;; esac ;;
+     12) p=$(gp_pick "How dark are nights?" "Pitch black" "Dark" "Normal ${G}(recommended)${N}" "Bright")
+         [[ -n $p ]] && gp_set "" NightDarkness "$p" ;;
+     13) p=$(gp_pick "How bad are injuries?" "Low ${G}(recommended for beginners)${N}" "Normal" "High")
+         [[ -n $p ]] && gp_set "" InjurySeverity "$p" ;;
+     14) p=$(gp_pick "Start with a bag of basic supplies?" "Yes ${G}(recommended for beginners)${N}" "No")
+         case $p in 1) gp_set "" StarterKit true ;; 2) gp_set "" StarterKit false ;; esac ;;
+     15) p=$(gp_pick "Extra trait points when making a character?" "0 (normal)" \
+               "+4 ${G}(recommended for beginners)${N}" "+8")
+         case $p in 1) gp_set "" CharacterFreePoints 0 ;; 2) gp_set "" CharacterFreePoints 4 ;; 3) gp_set "" CharacterFreePoints 8 ;; esac ;;
+      s|S) if [[ $GP_DIRTY == yes ]]; then gp_save && { GP_DIRTY=no; as_pz cat "$f" >"$GP_TMP"; }
+           else info "Nothing changed."; fi ;;
+      0|q|"")
+         if [[ $GP_DIRTY == yes ]] && ask_yn "You have unsaved changes. Save them now?" y; then gp_save; fi
+         rm -f "$GP_TMP"; return 0 ;;
+      *) warn "Unknown choice." ;;
+    esac
+    (( ${#GP_SKIPPED[@]} )) && warn "Not in this game version, skipped: ${GP_SKIPPED[*]}"
   done
 }
 
@@ -1246,7 +1501,7 @@ EOF
    1) Start                          7) Save now
    2) Stop                           8) Backup now
    3) Restart                        9) Restore a backup
-   4) ${W}Join info for friends${N}
+   4) ${W}Join info for friends${N}     19) ${W}Gameplay settings${N} (zombies, loot, XP)
    5) Status & players            ${W}Help / maintenance${N}
    6) Message all players           10) Live server log
                                     11) Settings
@@ -1263,7 +1518,7 @@ EOF
       1) cmd_start ;; 2) cmd_stop ;; 3) cmd_restart ;; 4) cmd_join ;; 5) cmd_status ;;
       6) cmd_say ;; 7) cmd_save ;; 8) cmd_backup ;; 9) cmd_restore ;; 10) cmd_logs ;;
       11) cmd_settings ;; 12) cmd_netcheck ;; 13) cmd_update_server ;; 14) cmd_report ;;
-      15) cmd_self_update ;; 16) cmd_setup ;; 17) cmd_uninstall ;; 18) cmd_pingcheck ;; 0|q) exit 0 ;;
+      15) cmd_self_update ;; 16) cmd_setup ;; 17) cmd_uninstall ;; 18) cmd_pingcheck ;; 19) cmd_gameplay ;; 0|q) exit 0 ;;
       *) warn "Unknown choice." ;;
     esac
     pause
@@ -1286,6 +1541,7 @@ pzhost ${PZHOST_VERSION} — Project Zomboid server manager for Debian 13 / Ubun
   pzhost restore         restore a backup
   pzhost logs            live server log
   pzhost settings        change passwords, memory, version, network
+  pzhost gameplay        gameplay settings: zombies, loot, XP (beginner preset)
   pzhost netcheck        Jio CGNAT / port forwarding check
   pzhost ping            ping / Wi-Fi / Tailscale direct-vs-relay check
   pzhost update-server   change/update the game server version
@@ -1319,6 +1575,7 @@ main() {
     restore)       cmd_restore ;;
     logs|log)      cmd_logs ;;
     settings)      cmd_settings ;;
+    gameplay|sandbox) cmd_gameplay ;;
     netcheck)      cmd_netcheck ;;
     ping|pingcheck) cmd_pingcheck ;;
     update-server) cmd_update_server ;;
