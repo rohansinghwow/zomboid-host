@@ -839,8 +839,147 @@ SKILLS = ["Fitness", "Strength", "Sprinting", "Lightfoot", "Nimble", "Sneak", "A
           "LongBlade", "SmallBlade", "Spear", "Maintenance", "Aiming", "Reloading", "Woodwork", "Cooking",
           "Farming", "Doctor", "Electricity", "MetalWelding", "Mechanics", "Tailoring", "Fishing", "Trapping",
           "PlantScavenging"]
-VEHICLES = [("Normal car", "Base.CarNormal"), ("Pickup truck", "Base.PickUpTruck"), ("Van", "Base.Van"),
-            ("Ambulance", "Base.VanAmbulance")]
+# Command library: (category, title, template, what it does, dangerous)
+# {p} = the chosen player, {p2} = the teleport target.  Build 42 syntax; "Show all commands"
+# lists what your own server version understands.
+COMMANDS = [
+    ("Help me", "Zombies ignore player — ON", 'invisibleplayer {p} -true', "Zombies stop following and attacking", False),
+    ("Help me", "Zombies ignore player — OFF", 'invisibleplayer {p} -false', "Back to normal", False),
+    ("Help me", "God mode — ON", 'godmodeplayer {p} -true', "The player can't be hurt", False),
+    ("Help me", "God mode — OFF", 'godmodeplayer {p} -false', "Back to normal", False),
+    ("Help me", "Walk through walls — ON", 'noclip {p} -true', "No-clip, to get out when stuck", False),
+    ("Help me", "Walk through walls — OFF", 'noclip {p} -false', "Back to normal", False),
+    ("Help me", "Teleport player to another player", 'teleportplayer {p} {p2}', "Moves the player next to the other one (pick the target in Teleport above)", False),
+    ("Give", "Give an item", 'additem {p} Base.Axe 1', "Change Base.Axe / the number — or use the item list above", False),
+    ("Give", "Give skill XP", 'addxp {p} Strength=1000', "Skills: Fitness, Strength, Axe, Blunt, Woodwork, Cooking, Farming, Doctor, Mechanics, Tailoring, Aiming…", False),
+    ("Give", "Spawn a car", 'addvehicle Base.CarNormal {p}', "Other cars: Base.PickUpTruck, Base.Van, Base.VanAmbulance, Base.SportsCar", False),
+    ("Give", "Spawn a pickup truck", 'addvehicle Base.PickUpTruck {p}', "Lots of trunk space", False),
+    ("Give", "Spawn an ambulance", 'addvehicle Base.VanAmbulance {p}', "", False),
+    ("Vehicles", "Spawn a car", 'addvehicle Base.CarNormal {p}', "Spawns next to the player. To repair a car or get its key: log in as admin in the game → right-click the car → Vehicle (admin)", False),
+    ("Vehicles", "Spawn a pickup truck", 'addvehicle Base.PickUpTruck {p}', "Big trunk, good for loot runs", False),
+    ("Vehicles", "Spawn an off-road SUV", 'addvehicle Base.OffRoad {p}', "Drives well on grass and dirt", False),
+    ("Vehicles", "Spawn a step van", 'addvehicle Base.StepVan {p}', "Huge storage", False),
+    ("Vehicles", "Spawn an ambulance", 'addvehicle Base.VanAmbulance {p}', "", False),
+    ("Vehicles", "Give 2 full gas cans", 'additem {p} Base.PetrolCan 2', "Right-click the car's gas tank to refuel", False),
+    ("Vehicles", "Give a car battery", 'additem {p} Base.CarBattery1 1', "For a car that won't start", False),
+    ("Vehicles", "Give a spare tire", 'additem {p} Base.NormalTire1 1', "", False),
+    ("Vehicles", "Give a jack", 'additem {p} Base.Jack 1', "Needed to change tires", False),
+    ("Vehicles", "Give a lug wrench", 'additem {p} Base.LugWrench 1', "Needed to change tires", False),
+    ("Vehicles", "Give a wrench", 'additem {p} Base.Wrench 1', "For engine and car parts", False),
+    ("Vehicles", "Give a screwdriver", 'additem {p} Base.Screwdriver 1', "For car parts", False),
+    ("Vehicles", "Mechanics XP +1000", 'addxp {p} Mechanics=1000', "Fix cars and remove parts faster", False),
+    ("Vehicles", "Electrical XP +1000", 'addxp {p} Electricity=1000', "Needed to hotwire cars without a key", False),
+    ("Meds", "Give 10 bandages", 'additem {p} Base.Bandage 10', "Right-click a wound in the Health panel to bandage", False),
+    ("Meds", "Give disinfectant", 'additem {p} Base.Disinfectant 2', "Clean wounds before bandaging to stop infection", False),
+    ("Meds", "Give painkillers", 'additem {p} Base.Pills 2', "Takes away pain", False),
+    ("Meds", "Give antibiotics", 'additem {p} Base.Antibiotics 2', "Cures an infected wound (not the zombie virus!)", False),
+    ("Meds", "Give suture needles", 'additem {p} Base.SutureNeedle 3', "Stitches deep wounds", False),
+    ("Meds", "Give tweezers", 'additem {p} Base.Tweezers 1', "Removes glass and bullets from wounds", False),
+    ("Meds", "Give a splint", 'additem {p} Base.Splint 1', "For broken bones", False),
+    ("Meds", "Give sleeping tablets", 'additem {p} Base.PillsSleepingTablets 1', "Helps to sleep", False),
+    ("Meds", "Give beta blockers", 'additem {p} Base.PillsBeta 1', "Calms panic", False),
+    ("Meds", "Give antidepressants", 'additem {p} Base.PillsAntiDep 1', "Against unhappiness", False),
+    ("Meds", "First Aid XP +1000", 'addxp {p} Doctor=1000', "Bandage and stitch faster and better", False),
+    ("Doors", "Walk through walls — ON (locked doors)", 'noclip {p} -true', "There is no unlock command. Walk through the door, then turn it OFF (or use the quick button above — it turns off by itself)", False),
+    ("Doors", "Walk through walls — OFF", 'noclip {p} -false', "", False),
+    ("Doors", "Give a crowbar", 'additem {p} Base.Crowbar 1', "Pry open locked doors and windows", False),
+    ("Doors", "Give a sledgehammer", 'additem {p} Base.Sledgehammer 1', "Smash through doors and walls", False),
+    ("Zombies", "Remove all zombies (loaded area)", 'remove zombies', "Clears zombies in the parts of the map that are loaded now", True),
+    ("Zombies", "Remove zombies around a spot", 'removezombies -x 10000 -y 10000 -z 0 -radius 50', "Change x / y to the place (shown on the map); try “help removezombies”", True),
+    ("Zombies", "Small practice horde (10)", 'createhorde 10 {p}', "Spawns 10 zombies near the player — to practise fighting", True),
+    ("Zombies", "Remove dead bodies", 'remove corpses', "Less lag, less sickness from corpses", False),
+    ("World", "Stop rain / storm", 'stopweather', "", False),
+    ("World", "Stop rain only", 'stoprain', "", False),
+    ("World", "Start rain", 'startrain 50', "Intensity 1–100. Fills rain collectors", False),
+    ("World", "Start a storm", 'startstorm 2', "Lasts 2 in-game hours", False),
+    ("World", "Thunder near player", 'thunder {p}', "", False),
+    ("World", "Lightning near player", 'lightning {p}', "", False),
+    ("World", "Helicopter event", 'chopper', "Loud! Attracts zombies from far away", True),
+    ("World", "Gunshot sound", 'gunshot', "Attracts zombies to a random player", True),
+    ("World", "Building alarm", 'alarm', "Sets off an alarm — attracts zombies", True),
+    ("World", "Remove all animals", 'remove animals', "", True),
+    ("World", "Remove all vehicles", 'remove vehicles', "Deletes ALL cars in loaded areas", True),
+    ("Server", "Save the world now", 'save', "", False),
+    ("Server", "Who is online", 'players', "", False),
+    ("Server", "Message to everyone", 'servermsg "Hello survivors!"', "Change the text between the quotes", False),
+    ("Server", "Show server options", 'showoptions', "Lists all settings and their values", False),
+    ("Server", "Pause the game when nobody is online", 'changeoption PauseEmpty "true"', "Time and zombies stop while the server is empty", False),
+    ("Server", "Allow sleeping", 'changeoption SleepAllowed "true"', "Lets players sleep in multiplayer", False),
+    ("Server", "Turn PvP off", 'changeoption PVP "false"', "Players can't hurt each other", False),
+    ("Server", "Turn PvP on", 'changeoption PVP "true"', "", False),
+    ("Server", "Max players: 10", 'changeoption MaxPlayers "10"', "Change the number if you want", False),
+    ("Server", "Reload server options", 'reloadoptions', "After editing the server .ini by hand", False),
+    ("Server", "Server statistics", 'stats help', "", False),
+    ("Server", "Check if mods need an update", 'checkModsNeedUpdate', "", False),
+    ("Server", "List all commands", 'help', "What this server version understands", False),
+    ("Players", "Reset a friend's forgotten password", 'setpassword {p} "newpassword"', "Change newpassword, then tell your friend", False),
+    ("Players", "Make player admin", 'setaccesslevel {p} admin', "Gives them the in-game Admin panel", True),
+    ("Players", "Make player moderator", 'setaccesslevel {p} moderator', "", True),
+    ("Players", "Remove admin / moderator", 'setaccesslevel {p} none', "Back to a normal player", False),
+    ("Players", "Kick player", 'kickuser {p} -r "Kicked by host"', "They can join again", True),
+    ("Players", "Ban player", 'banuser {p} -r "Banned by host"', "They can't join any more", True),
+    ("Players", "Unban player", 'unbanuser {p}', "", False),
+    ("Players", "Add a user account", 'adduser "newname" "password"', "Creates an account before they join", False),
+    ("Players", "Debug info about a player", 'debugplayer {p}', "", False),
+    ("Safehouse", "Release a safehouse", 'releasesafehouse "title"', "Frees a claimed safehouse (title = its name)", True),
+]
+
+# Item list: (label, item id, default count)
+ITEMS = [
+    ("— Medical —", None, 0),
+    ("Bandage", "Base.Bandage", 10), ("Disinfectant", "Base.Disinfectant", 2), ("Painkillers", "Base.Pills", 2),
+    ("Antibiotics", "Base.Antibiotics", 1), ("Suture needle", "Base.SutureNeedle", 3), ("Tweezers", "Base.Tweezers", 1),
+    ("Splint", "Base.Splint", 2), ("Cotton balls", "Base.CottonBalls", 5), ("Beta blockers", "Base.PillsBeta", 1),
+    ("Antidepressants", "Base.PillsAntiDep", 1), ("Sleeping tablets", "Base.PillsSleepingTablets", 1),
+    ("— Food & water —", None, 0),
+    ("Water bottle (full)", "Base.WaterBottleFull", 3), ("Canned beans", "Base.TinnedBeans", 5),
+    ("Canned chili", "Base.CannedChili", 3), ("Canned soup", "Base.TinnedSoup", 3), ("Tin opener", "Base.TinOpener", 1),
+    ("Chips", "Base.Crisps", 3), ("Peanut butter", "Base.PeanutButter", 1), ("Cereal", "Base.Cereal", 1),
+    ("— Weapons —", None, 0),
+    ("Axe", "Base.Axe", 1), ("Wood axe", "Base.WoodAxe", 1), ("Baseball bat", "Base.BaseballBat", 1),
+    ("Crowbar", "Base.Crowbar", 1), ("Machete", "Base.Machete", 1), ("Katana", "Base.Katana", 1),
+    ("Sledgehammer", "Base.Sledgehammer", 1), ("Kitchen knife", "Base.KitchenKnife", 1), ("Hunting knife", "Base.HuntingKnife", 1),
+    ("Pistol", "Base.Pistol", 1), ("9mm ammo box", "Base.Bullets9mmBox", 2), ("Shotgun", "Base.Shotgun", 1),
+    ("Shotgun shells box", "Base.ShotgunShellsBox", 2),
+    ("— Tools & building —", None, 0),
+    ("Hammer", "Base.Hammer", 1), ("Saw", "Base.Saw", 1), ("Screwdriver", "Base.Screwdriver", 1),
+    ("Nails", "Base.Nails", 100), ("Planks", "Base.Plank", 20), ("Garden shovel", "Base.Shovel", 1),
+    ("Sheet rope", "Base.SheetRope", 2), ("Wrench", "Base.Wrench", 1), ("Lug wrench", "Base.LugWrench", 1),
+    ("Jack", "Base.Jack", 1), ("Propane torch", "Base.BlowTorch", 1), ("Welder mask", "Base.WeldingMask", 1),
+    ("— Survival —", None, 0),
+    ("Big backpack", "Base.Bag_ALICEpack", 1), ("Hiking bag", "Base.Bag_BigHikingBag", 1),
+    ("Flashlight", "Base.Torch", 1), ("Batteries", "Base.Battery", 4), ("Lighter", "Base.Lighter", 1),
+    ("Matches", "Base.Matches", 2), ("Gas can (full)", "Base.PetrolCan", 2), ("Generator", "Base.Generator", 1),
+    ("Car battery", "Base.CarBattery1", 1), ("Walkie-talkie", "Base.WalkieTalkie2", 2), ("Sewing kit", "Base.SewingKit", 1),
+    ("Seeds: cabbage", "Base.CabbageBagSeed", 2), ("Seeds: potato", "Base.PotatoBagSeed", 2),
+]
+
+DANGEROUS = ("remove", "removezombies", "createhorde", "createhorde2", "chopper", "gunshot", "alarm", "banuser",
+             "kickuser", "setaccesslevel", "grantadmin", "releasesafehouse", "quit")
+
+
+def item_entries():
+    """[(label, id, count)] with the category in front of each label."""
+    out, cat = [], ""
+    for label, iid, n in ITEMS:
+        if iid is None:
+            cat = label.strip("— ").strip()
+        else:
+            out.append((f"{cat} · {label}", iid, n))
+    return out
+
+
+def searchable_combo(title, labels, subtitle=None):
+    row = string_combo(title, labels, subtitle)
+    row.set_enable_search(True)
+    row.set_expression(Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
+    return row
+
+
+VEHICLES = [("Normal car", "Base.CarNormal"), ("Pickup truck", "Base.PickUpTruck"), ("Pickup van", "Base.PickUpVan"),
+            ("Station wagon", "Base.CarStationWagon"), ("Off-road SUV", "Base.OffRoad"), ("Sports car", "Base.SportsCar"),
+            ("Van", "Base.Van"), ("Step van (big)", "Base.StepVan"), ("Ambulance", "Base.VanAmbulance"),
+            ("Police car", "Base.CarLightsPolice")]
 
 
 class ConsolePage(Adw.Bin):
@@ -865,6 +1004,29 @@ class ConsolePage(Adw.Bin):
         self.player_typed = Adw.EntryRow(title="…or type a username")
         pg.add(self.player_typed)
         page.add(pg)
+
+        # ---- quick help for beginners (one click, things turn themselves off again)
+        qg = Adw.PreferencesGroup(title="Quick help for beginners",
+                                  description="One click for the chosen player. Temporary help switches itself off.")
+        self._quick(qg, "I'm surrounded!", "Zombies ignore you + no damage for 2 minutes — walk away calmly",
+                    lambda u: [f"invisibleplayer {q(u)} -true", f"godmodeplayer {q(u)} -true"],
+                    lambda u: [f"invisibleplayer {q(u)} -false", f"godmodeplayer {q(u)} -false"], 120)
+        self._quick(qg, "I'm hurt", "Medical kit + no damage for 1 minute while you bandage",
+                    lambda u: [f"godmodeplayer {q(u)} -true"] + [f"additem {q(u)} {i} {n}" for i, n in KITS[0][2]],
+                    lambda u: [f"godmodeplayer {q(u)} -false"], 60)
+        self._quick(qg, "I'm stuck / locked door", "Walk through walls for 30 seconds + a crowbar",
+                    lambda u: [f"noclip {q(u)} -true", f"additem {q(u)} Base.Crowbar 1"],
+                    lambda u: [f"noclip {q(u)} -false"], 30)
+        self._quick(qg, "I'm hungry / thirsty", "Food & water kit",
+                    lambda u: [f"additem {q(u)} {i} {n}" for i, n in KITS[1][2]])
+        self._quick(qg, "I need a weapon", "Axe, bat, crowbar, knife",
+                    lambda u: [f"additem {q(u)} {i} {n}" for i, n in KITS[2][2]])
+        self._quick(qg, "I need a car", "Pickup truck next to you + 2 gas cans",
+                    lambda u: [f"addvehicle Base.PickUpTruck {q(u)}", f"additem {q(u)} Base.PetrolCan 2"])
+        self._quick(qg, "It's dark", "Flashlight + batteries + lighter",
+                    lambda u: [f"additem {q(u)} Base.Torch 1", f"additem {q(u)} Base.Battery 4",
+                               f"additem {q(u)} Base.Lighter 1"])
+        page.add(qg)
 
         # ---- safety
         sg = Adw.PreferencesGroup(title="Get out of trouble",
@@ -900,7 +1062,20 @@ class ConsolePage(Adw.Bin):
         r.add_suffix(self.skill)
         r.add_suffix(row_button("Give XP", self.give_xp))
         kg.add(r)
-        self.item = Adw.EntryRow(title="Any item ID, e.g. Base.Axe  (optional: Base.Nails 50)", show_apply_button=True)
+        self.items = item_entries()
+        self.item_pick = searchable_combo("Item", [f"{l}  ({i})" for l, i, _ in self.items],
+                                          "Pick from the list (type to search)")
+        self.item_count = Adw.SpinRow.new_with_range(1, 500, 1)
+        self.item_count.set_title("How many")
+        self.item_count.set_value(self.items[0][2])
+        self.item_pick.connect("notify::selected", lambda *_: self.item_count.set_value(
+            self.items[self.item_pick.get_selected()][2]))
+        give_row = Adw.ActionRow(title="Give the picked item")
+        give_row.add_suffix(row_button("Give", self.give_picked, "suggested-action"))
+        kg.add(self.item_pick)
+        kg.add(self.item_count)
+        kg.add(give_row)
+        self.item = Adw.EntryRow(title="…or type an item ID, e.g. Base.Axe  (optional: Base.Nails 50)", show_apply_button=True)
         self.item.connect("apply", lambda *_: self.give_custom())
         kg.add(self.item)
         page.add(kg)
@@ -932,6 +1107,20 @@ class ConsolePage(Adw.Bin):
         self._cmd(vg, "Show all commands", "Lists every command this server version understands", "Help", ["help"])
         page.add(vg)
 
+        # ---- command library
+        lg = Adw.PreferencesGroup(title="More commands",
+                                  description="Pick one (type to search), press Use — it goes into the box below "
+                                              "with the chosen player filled in. Check it, then press ↵ to send.")
+        self.lib = searchable_combo("Command", [f"{c} · {t}" for c, t, _, _, _ in COMMANDS])
+        self.lib.connect("notify::selected", lambda *_: self.lib_changed())
+        lg.add(self.lib)
+        self.lib_info = Adw.ActionRow(title="", subtitle="", subtitle_lines=3)
+        self.lib_info.add_css_class("property")
+        self.lib_info.add_suffix(row_button("Use", self.lib_use, "suggested-action"))
+        lg.add(self.lib_info)
+        page.add(lg)
+        self.lib_changed()
+
         # ---- free command + output
         og = Adw.PreferencesGroup(title="Type a command",
                                   description="Without the “/”. Example: additem \"bob\" Base.Axe 1")
@@ -954,6 +1143,24 @@ class ConsolePage(Adw.Bin):
                                 "suggested-action"))
         r.add_suffix(row_button("Off", lambda: self.for_player(lambda u: make(u, "false"), f"{title} OFF")))
         group.add(r)
+
+    def _quick(self, group, title, sub, make_on, make_off=None, seconds=0):
+        r = Adw.ActionRow(title=title, subtitle=sub)
+        r.add_suffix(row_button("Help!", lambda: self.quick(title, make_on, make_off, seconds), "suggested-action"))
+        group.add(r)
+
+    def quick(self, title, make_on, make_off, seconds):
+        u = self.selected_player()
+        if not u:
+            self.app.win.toast("Pick a player first (refresh), or type a username")
+            return
+        self.run(make_on(u), f"{title} — {u}")
+        if make_off and seconds:
+            def off():
+                self.run(make_off(u), f"{title} — back to normal for {u}")
+                return False
+            GLib.timeout_add_seconds(seconds, off)
+            self.app.win.toast(f"Turns itself off in {seconds} seconds")
 
     def _cmd(self, group, title, sub, label, cmds, confirm=False):
         r = Adw.ActionRow(title=title)
@@ -1047,12 +1254,36 @@ class ConsolePage(Adw.Bin):
         sk = SKILLS[self.skill.get_selected()]
         self.for_player(lambda u: [f"addxp {q(u)} {sk}=1000"], f"1000 XP {sk}")
 
+    def give_picked(self):
+        label, iid, _ = self.items[self.item_pick.get_selected()]
+        n = int(self.item_count.get_value())
+        self.for_player(lambda u: [f"additem {q(u)} {iid} {n}"], f"Give {n}× {label.split(' · ')[-1]}")
+
+    def lib_changed(self):
+        c, t, tpl, desc, danger = COMMANDS[self.lib.get_selected()]
+        self.lib_info.set_title(tpl)
+        self.lib_info.set_subtitle(("⚠ " if danger else "") + (desc or t))
+
+    def lib_use(self):
+        _, t, tpl, _, _ = COMMANDS[self.lib.get_selected()]
+        if "{p}" in tpl or "{p2}" in tpl:
+            u = self.selected_player()
+            if not u:
+                self.app.win.toast("Pick a player first (refresh), or type a username")
+                return
+            i = self.tp_target.get_selected()
+            p2 = self.names[i] if self.names and i < len(self.names) else "OTHERPLAYER"
+            tpl = tpl.replace("{p2}", q(p2)).replace("{p}", q(u))
+        self.free.set_text(tpl)
+        self.free.grab_focus()
+        self.app.win.toast("Check the command, then press ↵ (or the ✓) to send")
+
     def send_free(self):
         cmd = self.free.get_text().strip().lstrip("/")
         if not cmd:
             return
         self.free.set_text("")
-        self.run([cmd], cmd)
+        self.run([cmd], cmd, confirm=cmd.split()[0].lower() in DANGEROUS)
 
     def on_shown(self):
         if self.app.status.get("running") == "yes" and not self.names:

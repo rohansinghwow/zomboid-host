@@ -65,7 +65,7 @@ The **Zomboid Host** window opens by itself (later: app menu or desktop icon).
 | **Server** | Start / Stop / Restart · join info (IP, port, password) with copy buttons · players online · message everyone |
 | **Gameplay** | **Beginner** / Normal / Hard presets · zombies, speed, infection, XP, loot, day length, water/power, zombie respawn… |
 | **World** | Save now · backup now · restore a backup · **Start a new world** |
-| **Console** | Admin helpers for a chosen player: **Rescue mode** (zombies ignore you + no damage), zombies ignore player, god mode, walk through walls, teleport · give kits (medical, food & water, weapons, building, backpack, fuel), a car, skill XP, any item · remove all zombies / corpses · stop or start rain · kick, make admin · type any console command and see the server's answer |
+| **Console** | **Quick help for beginners** (one click, switches itself off): *I'm surrounded!* · *I'm hurt* · *I'm stuck / locked door* · *hungry / thirsty* · *need a weapon* · *need a car* · *it's dark* — plus rescue mode, god mode, walk through walls, teleport · searchable **item list** (~57 items) and **command list** (~80 commands: vehicles, meds, doors, zombies, weather, server, players) · type any console command and see the server's answer |
 | **Laptop** | **Make this laptop a server**: battery stops at 80%, no sleep, Wi-Fi never sleeps + reconnects by itself, server starts on boot |
 | **More** | Join password, memory, auto-save, game version · ping check · server log · **Send error report** · **Update this app** · repair · uninstall |
 
