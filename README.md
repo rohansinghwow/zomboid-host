@@ -29,6 +29,25 @@ cd ~/zomboid-host
 > To send error reports you need a free GitHub account; the app asks you to log in
 > (`gh auth login`) the first time you send one.
 
+### Already have an older version? (update to the window app)
+
+Nothing is reinstalled: your world, passwords, settings and the downloaded server are kept.
+Do it when nobody is playing.
+
+**Easiest:** open the old app (`pzhost`) → **15) Update this app** → answer **Enter** (yes) to *Repair*.
+
+**Or by hand** (`git pull` alone only downloads the files — `./install.sh` puts the window app in place):
+
+```bash
+cd "$(cat ~/.config/pzhost/source_dir)"   # the folder you cloned, e.g. ~/zomboid-host
+git pull
+./install.sh
+```
+
+Then open **Zomboid Host** from the app menu or desktop icon (or type `pzhost-gui`; the first time,
+running it from a terminal shows any error). If the icon still opens the old terminal version, log out and back in once.
+Afterwards: **Laptop** tab → **Set up**, then reboot once.
+
 ### 2. Set up
 
 The **Zomboid Host** window opens by itself (later: app menu or desktop icon).
