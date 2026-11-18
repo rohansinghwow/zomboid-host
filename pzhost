@@ -8,7 +8,7 @@
 #          pzhost help       (list all commands)
 # =============================================================================
 
-PZHOST_VERSION="1.6.1"
+PZHOST_VERSION="1.7.0"
 REPO="rohansinghwow/zomboid-host"
 
 # ---- fixed paths -------------------------------------------------------------
@@ -1354,6 +1354,22 @@ cmd_say() {
   send_console "servermsg \"${m}\"" && ok "Message sent."
 }
 
+cmd_console() {  # pzhost console "cmd" ["cmd2" …] — run server console commands, print the server's answer
+  require_installed || return 1; sudo_start || return 1
+  server_active || { err "The server is not running — start it first."; return 1; }
+  local ts c n=0; ts=$(date +%s)
+  for c in "$@"; do
+    c=${c//$'\n'/ }; c=${c//$'\r'/}; c=${c#/}   # one line each; the console wants no leading "/"
+    [[ -n ${c// /} ]] || continue
+    send_console "$c" || return 1
+    n=$((n + 1)); sleep 0.3
+  done
+  (( n )) || { err "No command given."; return 1; }
+  sleep 2
+  echo "── server answer ──"
+  sudo journalctl -q -u pzserver.service --since "@${ts}" -o cat --no-pager | grep -v '^$' | tail -n 80
+}
+
 cmd_players() {
   sudo_start || return 1
   local ts; ts=$(date +%s)
@@ -1745,6 +1761,10 @@ gp_injury_label() {
   esac
 }
 gp_kit_label() { case $(gp_get "" StarterKit) in true) echo "Yes" ;; false) echo "No" ;; *) echo "?" ;; esac; }
+gp_respawn_label() {
+  local v; v=$(gp_get "" RespawnHours) || { echo "?"; return; }
+  awk -v h="$v" 'BEGIN{ if (h==0) print "Never (cleared areas stay clear)"; else printf "after about %d hours\n", h }'
+}
 gp_points_label() { local v; v=$(gp_get "" CharacterFreePoints) || { echo "?"; return; }; echo "+${v}"; }
 
 gp_preset() {
@@ -1753,17 +1773,17 @@ gp_preset() {
       gp_pop_set 0.35; gp_set ZombieLore Speed 3; gp_set ZombieLore Strength 3; gp_set ZombieLore Toughness 3
       gp_set ZombieLore Transmission 2; gp_set "" DayLength 4; gp_xp_set 2.0; gp_loot_set 1.0
       gp_utils_set 90; gp_set "" NightDarkness 3; gp_set "" InjurySeverity 1; gp_set "" StarterKit true
-      gp_set "" CharacterFreePoints 4 ;;
+      gp_set "" CharacterFreePoints 4; gp_set "" RespawnHours 0 ;;
     normal)
       gp_pop_set 0.65; gp_set ZombieLore Speed 2; gp_set ZombieLore Strength 2; gp_set ZombieLore Toughness 2
       gp_set ZombieLore Transmission 1; gp_set "" DayLength 3; gp_xp_set 1.0; gp_loot_set 0.6
       gp_utils_set 14; gp_set "" NightDarkness 3; gp_set "" InjurySeverity 2; gp_set "" StarterKit false
-      gp_set "" CharacterFreePoints 0 ;;
+      gp_set "" CharacterFreePoints 0; gp_set "" RespawnHours 72 ;;
     hard)
       gp_pop_set 1.2; gp_set ZombieLore Speed 2; gp_set ZombieLore Strength 2; gp_set ZombieLore Toughness 2
       gp_set ZombieLore Transmission 1; gp_set "" DayLength 3; gp_xp_set 1.0; gp_loot_set 0.4
       gp_utils_set 7; gp_set "" NightDarkness 2; gp_set "" InjurySeverity 3; gp_set "" StarterKit false
-      gp_set "" CharacterFreePoints 0 ;;
+      gp_set "" CharacterFreePoints 0; gp_set "" RespawnHours 24 ;;
   esac
 }
 
@@ -1822,6 +1842,7 @@ gp_apply_kv() {  # gp_apply_kv KEY VALUE — one option by its short name (used 
     injury)    gp_set "" InjurySeverity "$v" ;;
     kit)       gp_set "" StarterKit "$v" ;;
     points)    gp_set "" CharacterFreePoints "$v" ;;
+    respawn)   gp_set "" RespawnHours "$v" ;;
     *) err "Unknown option: $k"; return 1 ;;
   esac
   return 0
@@ -1842,6 +1863,7 @@ cmd_gameplay_get() {  # prints key=value (raw values) for the GUI
   echo "injury=$(gp_get "" InjurySeverity)"
   echo "kit=$(gp_get "" StarterKit)"
   echo "points=$(gp_get "" CharacterFreePoints)"
+  echo "respawn=$(gp_get "" RespawnHours)"
   rm -f "$GP_TMP"; return 0
 }
 
@@ -1871,7 +1893,8 @@ cmd_gameplay() {
 
   ${W}Quick presets${N}
    1) ${G}Beginner${N}  few slow weak zombies, only bites infect, 2x XP, more loot,
-                 longer days, water/power stay on ~3 months, starter bag, +4 trait points
+                 longer days, water/power ~3 months, starter bag, +4 trait points,
+                 cleared areas stay clear (no zombie respawn)
    2) Normal    the game's standard "Apocalypse" settings
    3) Hard      more zombies, less loot, darker nights, power/water off after a week
 
@@ -1888,6 +1911,7 @@ cmd_gameplay() {
   13) Injury severity                     $(gp_injury_label)
   14) Starter bag on spawn                $(gp_kit_label)
   15) Extra trait points for characters   $(gp_points_label)
+  16) Zombies come back to cleared areas  $(gp_respawn_label)
 
    ${W}s) Save and apply${N}          0) Back
   ${D}Note: loot changes only fill containers nobody has opened yet. Water/power
@@ -1933,6 +1957,9 @@ EOF
      15) p=$(gp_pick "Extra trait points when making a character?" "0 (normal)" \
                "+4 ${G}(recommended for beginners)${N}" "+8")
          case $p in 1) gp_set "" CharacterFreePoints 0 ;; 2) gp_set "" CharacterFreePoints 4 ;; 3) gp_set "" CharacterFreePoints 8 ;; esac ;;
+     16) p=$(gp_pick "Do zombies come back to areas you cleared?" "Never ${G}(recommended for beginners)${N}" \
+               "Slowly (after ~9 days)" "Normal (after ~3 days)" "Fast (after 1 day)")
+         case $p in 1) gp_set "" RespawnHours 0 ;; 2) gp_set "" RespawnHours 216 ;; 3) gp_set "" RespawnHours 72 ;; 4) gp_set "" RespawnHours 24 ;; esac ;;
       s|S) if [[ $GP_DIRTY == yes ]]; then gp_save && { GP_DIRTY=no; as_pz cat "$f" >"$GP_TMP"; }
            else info "Nothing changed."; fi ;;
       0|q|"")
@@ -2229,6 +2256,7 @@ pzhost ${PZHOST_VERSION} — Project Zomboid server manager for Debian 13 / Ubun
   pzhost status          status, players, backups
   pzhost players         list online players
   pzhost say "text"      message all players
+  pzhost console "cmd"…  run server console commands (e.g. 'invisibleplayer "bob" -true')
   pzhost save            save world now
   pzhost backup          backup now
   pzhost restore         restore a backup
@@ -2270,6 +2298,7 @@ main() {
     status)        cmd_status ;;
     players)       cmd_players ;;
     say|msg)       cmd_say "$*" ;;
+    console|cmd)   cmd_console "$@" ;;
     save)          cmd_save ;;
     backup)        cmd_backup ;;
     restore)       cmd_restore "$@" ;;

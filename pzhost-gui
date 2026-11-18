@@ -68,10 +68,13 @@ GAMEPLAY = [
      [("Yes" + REC, "true"), ("No", "false")]),
     ("points", "Extra trait points for new characters", None,
      [("0 (normal)", "0"), ("+4" + REC, "4"), ("+8", "8")]),
+    ("respawn", "Zombies come back to cleared areas", "“Never” = places you cleared stay safe",
+     [("Never" + REC, "0"), ("Slowly (after ~9 days)", "216"), ("Normal (after ~3 days)", "72"),
+      ("Fast (after 1 day)", "24")]),
 ]
 PRESETS = [
     ("beginner", "Beginner", "Few slow, weak zombies · only bites infect · 2x XP · more loot · longer days · "
-                             "water/power ~3 months · starter bag · +4 trait points"),
+                             "water/power ~3 months · starter bag · +4 trait points · cleared areas stay clear"),
     ("normal", "Normal", "The game's standard “Apocalypse” settings"),
     ("hard", "Hard", "More zombies · less loot · darker nights · water/power off after a week"),
 ]
@@ -268,11 +271,13 @@ class Window(Adw.ApplicationWindow):
         self.gameplay = GameplayPage(app)
         self.world = WorldPage(app)
         self.laptop = LaptopPage(app)
+        self.console = ConsolePage(app)
         self.more = MorePage(app)
         self.stack.add_titled_with_icon(self.setup_page, "setup", "Set up", "emblem-system-symbolic")
         self.stack.add_titled_with_icon(self.home, "home", "Server", "network-server-symbolic")
         self.stack.add_titled_with_icon(self.gameplay, "gameplay", "Gameplay", "applications-games-symbolic")
         self.stack.add_titled_with_icon(self.world, "world", "World", "folder-saved-search-symbolic")
+        self.stack.add_titled_with_icon(self.console, "console", "Console", "utilities-terminal-symbolic")
         self.stack.add_titled_with_icon(self.laptop, "laptop", "Laptop", "computer-symbolic")
         self.stack.add_titled_with_icon(self.more, "more", "More", "preferences-system-symbolic")
         self.stack.connect("notify::visible-child", self._page_changed)
@@ -283,13 +288,13 @@ class Window(Adw.ApplicationWindow):
             page.on_shown()
 
     def set_installed(self, installed):
-        for name in ("home", "gameplay", "world", "laptop"):
+        for name in ("home", "gameplay", "world", "console", "laptop"):
             self.stack.get_page(self.stack.get_child_by_name(name)).set_visible(installed)
         self.stack.get_page(self.setup_page).set_visible(not installed)
         cur = self.stack.get_visible_child_name()
         if installed and cur == "setup":
             self.stack.set_visible_child_name("home")
-        elif not installed and cur in ("home", "gameplay", "world", "laptop"):
+        elif not installed and cur in ("home", "gameplay", "world", "console", "laptop"):
             self.stack.set_visible_child_name("setup")
 
     def toast(self, text):
@@ -805,6 +810,253 @@ class LaptopPage(Adw.Bin):
 
     def on_shown(self):
         self.app.refresh_status()
+
+
+# ---------------------------------------------------------------- Console (admin commands)
+def q(name):
+    """Quote a player name for the console (names can't contain quotes)."""
+    return '"' + name.replace('"', "").strip() + '"'
+
+
+# Supply kits: (title, subtitle, [(item id, count), ...]).  Item IDs are Build 42 "Base.*" names;
+# if one doesn't exist in your build the server answer below says so (the rest still arrive).
+KITS = [
+    ("Medical kit", "Bandages, disinfectant, painkillers, antibiotics, suture needles, tweezers",
+     [("Base.Bandage", 10), ("Base.Disinfectant", 2), ("Base.Pills", 2), ("Base.Antibiotics", 1),
+      ("Base.SutureNeedle", 3), ("Base.Tweezers", 1)]),
+    ("Food & water", "Canned food, tin opener, water bottles",
+     [("Base.TinnedBeans", 5), ("Base.CannedChili", 3), ("Base.TinOpener", 1), ("Base.WaterBottleFull", 3)]),
+    ("Weapons", "Axe, baseball bat, crowbar, kitchen knife",
+     [("Base.Axe", 1), ("Base.BaseballBat", 1), ("Base.Crowbar", 1), ("Base.KitchenKnife", 1)]),
+    ("Building kit", "Hammer, saw, nails, planks",
+     [("Base.Hammer", 1), ("Base.Saw", 1), ("Base.Nails", 100), ("Base.Plank", 20)]),
+    ("Big backpack", "A large military backpack to carry more",
+     [("Base.Bag_ALICEpack", 1)]),
+    ("Fuel", "Two full gas cans",
+     [("Base.PetrolCan", 2)]),
+]
+SKILLS = ["Fitness", "Strength", "Sprinting", "Lightfoot", "Nimble", "Sneak", "Axe", "Blunt", "SmallBlunt",
+          "LongBlade", "SmallBlade", "Spear", "Maintenance", "Aiming", "Reloading", "Woodwork", "Cooking",
+          "Farming", "Doctor", "Electricity", "MetalWelding", "Mechanics", "Tailoring", "Fishing", "Trapping",
+          "PlantScavenging"]
+VEHICLES = [("Normal car", "Base.CarNormal"), ("Pickup truck", "Base.PickUpTruck"), ("Van", "Base.Van"),
+            ("Ambulance", "Base.VanAmbulance")]
+
+
+class ConsolePage(Adw.Bin):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.names = []
+        page = Adw.PreferencesPage()
+        self.set_child(page)
+
+        self.off_banner = Adw.PreferencesGroup(
+            title="Admin console",
+            description="Cheats and helpers for the running server. Pick a player, then press a button. "
+                        "The server's answer appears at the bottom.")
+        page.add(self.off_banner)
+
+        # ---- player picker
+        pg = Adw.PreferencesGroup(title="Player")
+        self.player = Adw.ComboRow(title="Who", model=Gtk.StringList.new(["(press refresh)"]))
+        self.player.add_suffix(row_button("", self.refresh_players, "flat", icon="view-refresh-symbolic"))
+        pg.add(self.player)
+        self.player_typed = Adw.EntryRow(title="…or type a username")
+        pg.add(self.player_typed)
+        page.add(pg)
+
+        # ---- safety
+        sg = Adw.PreferencesGroup(title="Get out of trouble",
+                                  description="There is no “heal” command — use God mode + a Medical kit, "
+                                              "or Rescue mode while you patch yourself up.")
+        self._toggle(sg, "Rescue mode", "Zombies ignore the player AND no damage — perfect to escape a horde",
+                     lambda u, on: [f"invisibleplayer {q(u)} -{on}", f"godmodeplayer {q(u)} -{on}"])
+        self._toggle(sg, "Zombies ignore player", "Zombies stop following / attacking (invisible to them)",
+                     lambda u, on: [f"invisibleplayer {q(u)} -{on}"])
+        self._toggle(sg, "God mode", "The player can't be hurt", lambda u, on: [f"godmodeplayer {q(u)} -{on}"])
+        self._toggle(sg, "Walk through walls", "No-clip — to get out when stuck",
+                     lambda u, on: [f"noclip {q(u)} -{on}"])
+        r = Adw.ActionRow(title="Bring player to another player", subtitle="Teleports the chosen player to…")
+        self.tp_target = Gtk.DropDown(model=Gtk.StringList.new(["(refresh players)"]), valign=Gtk.Align.CENTER)
+        r.add_suffix(self.tp_target)
+        r.add_suffix(row_button("Teleport", self.teleport))
+        sg.add(r)
+        page.add(sg)
+
+        # ---- supplies
+        kg = Adw.PreferencesGroup(title="Give supplies", description="Items go into the player's inventory")
+        for title, sub, items in KITS:
+            r = Adw.ActionRow(title=title, subtitle=sub)
+            r.add_suffix(row_button("Give", lambda it=items, t=title: self.give(t, it)))
+            kg.add(r)
+        r = Adw.ActionRow(title="Car", subtitle="Spawns next to the player")
+        self.vehicle = Gtk.DropDown(model=Gtk.StringList.new([v[0] for v in VEHICLES]), valign=Gtk.Align.CENTER)
+        r.add_suffix(self.vehicle)
+        r.add_suffix(row_button("Spawn", self.spawn_vehicle))
+        kg.add(r)
+        r = Adw.ActionRow(title="Skill XP", subtitle="Gives 1000 XP in one skill")
+        self.skill = Gtk.DropDown(model=Gtk.StringList.new(SKILLS), valign=Gtk.Align.CENTER)
+        r.add_suffix(self.skill)
+        r.add_suffix(row_button("Give XP", self.give_xp))
+        kg.add(r)
+        self.item = Adw.EntryRow(title="Any item ID, e.g. Base.Axe  (optional: Base.Nails 50)", show_apply_button=True)
+        self.item.connect("apply", lambda *_: self.give_custom())
+        kg.add(self.item)
+        page.add(kg)
+
+        # ---- world
+        wg = Adw.PreferencesGroup(title="World & zombies",
+                                  description="To stop zombies coming back to cleared areas: Gameplay → "
+                                              "“Zombies come back to cleared areas” → Never")
+        self._cmd(wg, "Remove all zombies", "Clears the zombies in the parts of the map that are loaded right now",
+                  "Remove", ["remove zombies"], confirm=True)
+        self._cmd(wg, "Remove dead bodies", "Clears corpses (less lag, less sickness)", "Remove",
+                  ["remove corpses"])
+        self._cmd(wg, "Stop rain / storm", None, "Stop", ["stopweather"])
+        self._cmd(wg, "Start rain", "Fills rain collectors", "Rain", ["startrain 50"])
+        page.add(wg)
+
+        # ---- server
+        vg = Adw.PreferencesGroup(title="Server")
+        self._cmd(vg, "Save the world", None, "Save", ["save"])
+        self._cmd(vg, "Who is online", None, "Show", ["players"])
+        r = Adw.ActionRow(title="Kick the chosen player", subtitle="They can join again")
+        r.add_suffix(row_button("Kick", lambda: self.for_player(
+            lambda u: [f'kickuser {q(u)} -r "Kicked by host"'], "Kick", confirm=True), "destructive-action"))
+        vg.add(r)
+        r = Adw.ActionRow(title="Make the chosen player an admin", subtitle="Gives them the in-game Admin panel")
+        r.add_suffix(row_button("Make admin", lambda: self.for_player(
+            lambda u: [f"setaccesslevel {q(u)} admin"], "Admin", confirm=True)))
+        vg.add(r)
+        self._cmd(vg, "Show all commands", "Lists every command this server version understands", "Help", ["help"])
+        page.add(vg)
+
+        # ---- free command + output
+        og = Adw.PreferencesGroup(title="Type a command",
+                                  description="Without the “/”. Example: additem \"bob\" Base.Axe 1")
+        self.free = Adw.EntryRow(title="Console command", show_apply_button=True)
+        self.free.connect("apply", lambda *_: self.send_free())
+        og.add(self.free)
+        self.out = Gtk.TextBuffer()
+        view = Gtk.TextView(buffer=self.out, editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                            top_margin=8, bottom_margin=8, left_margin=8, right_margin=8)
+        self.out_view = view
+        sw = Gtk.ScrolledWindow(child=view, min_content_height=220, margin_top=8)
+        sw.add_css_class("card")
+        og.add(sw)
+        page.add(og)
+
+    # ---- building blocks
+    def _toggle(self, group, title, sub, make):
+        r = Adw.ActionRow(title=title, subtitle=sub)
+        r.add_suffix(row_button("On", lambda: self.for_player(lambda u: make(u, "true"), f"{title} ON"),
+                                "suggested-action"))
+        r.add_suffix(row_button("Off", lambda: self.for_player(lambda u: make(u, "false"), f"{title} OFF")))
+        group.add(r)
+
+    def _cmd(self, group, title, sub, label, cmds, confirm=False):
+        r = Adw.ActionRow(title=title)
+        if sub:
+            r.set_subtitle(sub)
+        r.add_suffix(row_button(label, lambda: self.run(cmds, title, confirm)))
+        group.add(r)
+
+    def selected_player(self):
+        typed = self.player_typed.get_text().strip()
+        if typed:
+            return typed
+        i = self.player.get_selected()
+        if self.names and 0 <= i < len(self.names):
+            return self.names[i]
+        return None
+
+    def for_player(self, make, title, confirm=False):
+        u = self.selected_player()
+        if not u:
+            self.app.win.toast("Pick a player first (refresh), or type a username")
+            return
+        self.run(make(u), f"{title} — {u}", confirm)
+
+    def run(self, cmds, title, confirm=False):
+        if self.app.status.get("running") != "yes":
+            self.app.win.toast("Start the server first (Server tab)")
+            return
+
+        def go():
+            self.log(f"▶ {title}\n" + "".join(f"  > {c}\n" for c in cmds))
+
+            def done(rc, out):
+                ans = ANSI.sub("", out).replace("── server answer ──\n", "").strip()
+                self.log((ans or "(no answer from the server)") + "\n\n")
+                self.app.win.toast(f"{title}: sent" if rc == 0 else f"{title}: failed")
+            self.app.query(["console", *cmds], done, timeout=90)
+        if confirm:
+            self.app.confirm(f"{title}?", "Sends: " + " · ".join(cmds), "Do it", lambda: self.app.with_sudo(go),
+                             destructive=True)
+        else:
+            self.app.with_sudo(go)
+
+    def log(self, text):
+        self.out.insert(self.out.get_end_iter(), text)
+        self.out_view.scroll_to_mark(self.out.create_mark(None, self.out.get_end_iter(), False), 0, False, 0, 1)
+
+    # ---- actions
+    def refresh_players(self):
+        if self.app.status.get("running") != "yes":
+            self.app.win.toast("Server is stopped")
+            return
+
+        def done(rc, out):
+            names = [l.strip().lstrip("-").strip() for l in ANSI.sub("", out).splitlines()
+                     if l.strip().startswith("-")]
+            self.names = names
+            labels = names or ["Nobody online"]
+            self.player.set_model(Gtk.StringList.new(labels))
+            self.tp_target.set_model(Gtk.StringList.new(labels))
+            self.app.win.toast(f"{len(names)} player(s) online")
+        self.app.with_sudo(lambda: self.app.query(["players"], done))
+
+    def teleport(self):
+        i = self.tp_target.get_selected()
+        if not self.names or i >= len(self.names):
+            self.app.win.toast("Refresh players first")
+            return
+        target = self.names[i]
+        self.for_player(lambda u: [f"teleportplayer {q(u)} {q(target)}"], f"Teleport to {target}")
+
+    def give(self, title, items):
+        self.for_player(lambda u: [f"additem {q(u)} {item} {n}" for item, n in items], f"Give {title}")
+
+    def give_custom(self):
+        parts = self.item.get_text().split()
+        if not parts:
+            return
+        item = parts[0]
+        n = parts[1] if len(parts) > 1 and parts[1].isdigit() else "1"
+        if not re.match(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$", item):
+            self.app.win.toast("Item IDs look like Base.Axe")
+            return
+        self.for_player(lambda u: [f"additem {q(u)} {item} {n}"], f"Give {item} x{n}")
+
+    def spawn_vehicle(self):
+        name, vid = VEHICLES[self.vehicle.get_selected()]
+        self.for_player(lambda u: [f"addvehicle {vid} {q(u)}"], f"Spawn {name}")
+
+    def give_xp(self):
+        sk = SKILLS[self.skill.get_selected()]
+        self.for_player(lambda u: [f"addxp {q(u)} {sk}=1000"], f"1000 XP {sk}")
+
+    def send_free(self):
+        cmd = self.free.get_text().strip().lstrip("/")
+        if not cmd:
+            return
+        self.free.set_text("")
+        self.run([cmd], cmd)
+
+    def on_shown(self):
+        if self.app.status.get("running") == "yes" and not self.names:
+            self.refresh_players()
 
 
 # ---------------------------------------------------------------- More (settings + help)
