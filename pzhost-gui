@@ -982,54 +982,72 @@ VEHICLES = [("Normal car", "Base.CarNormal"), ("Pickup truck", "Base.PickUpTruck
             ("Police car", "Base.CarLightsPolice")]
 
 
+# Quick actions: key -> (button title, explanation, commands on, commands off, seconds until off)
+QUICK = {
+    "surrounded": ("I'm surrounded!", "Zombies ignore + no damage for 2 minutes — walk away calmly",
+                   lambda u: [f"invisibleplayer {q(u)} -true", f"godmodeplayer {q(u)} -true"],
+                   lambda u: [f"invisibleplayer {q(u)} -false", f"godmodeplayer {q(u)} -false"], 120),
+    "hurt": ("I'm hurt", "Medical kit + no damage for 1 minute while bandaging",
+             lambda u: [f"godmodeplayer {q(u)} -true"] + [f"additem {q(u)} {i} {n}" for i, n in KITS[0][2]],
+             lambda u: [f"godmodeplayer {q(u)} -false"], 60),
+    "stuck": ("I'm stuck / locked door", "Walk through walls for 30 seconds + a crowbar",
+              lambda u: [f"noclip {q(u)} -true", f"additem {q(u)} Base.Crowbar 1"],
+              lambda u: [f"noclip {q(u)} -false"], 30),
+    "hungry": ("I'm hungry / thirsty", "Food & water kit",
+               lambda u: [f"additem {q(u)} {i} {n}" for i, n in KITS[1][2]], None, 0),
+    "weapon": ("I need a weapon", "Axe, bat, crowbar, knife",
+               lambda u: [f"additem {q(u)} {i} {n}" for i, n in KITS[2][2]], None, 0),
+    "car": ("I need a car", "Pickup truck next to the player + 2 gas cans",
+            lambda u: [f"addvehicle Base.PickUpTruck {q(u)}", f"additem {q(u)} Base.PetrolCan 2"], None, 0),
+    "dark": ("It's dark", "Flashlight + batteries + lighter",
+             lambda u: [f"additem {q(u)} Base.Torch 1", f"additem {q(u)} Base.Battery 4",
+                        f"additem {q(u)} Base.Lighter 1"], None, 0),
+}
+
+
 class ConsolePage(Adw.Bin):
     def __init__(self, app):
         super().__init__()
         self.app = app
-        self.names = []
+        self.names = []          # online players (from the server)
+        self.extra = []          # names typed by hand (e.g. offline)
+        self.player_rows = {}    # name -> (row, checkbox)
         page = Adw.PreferencesPage()
         self.set_child(page)
 
         self.off_banner = Adw.PreferencesGroup(
             title="Admin console",
-            description="Cheats and helpers for the running server. Pick a player, then press a button. "
-                        "The server's answer appears at the bottom.")
+            description="Tick the players below, then press a button. Buttons in “whole world” sections affect "
+                        "everyone. The server's answer appears at the bottom.")
         page.add(self.off_banner)
 
-        # ---- player picker
-        pg = Adw.PreferencesGroup(title="Player")
-        self.player = Adw.ComboRow(title="Who", model=Gtk.StringList.new(["(press refresh)"]))
-        self.player.add_suffix(row_button("", self.refresh_players, "flat", icon="view-refresh-symbolic"))
-        pg.add(self.player)
-        self.player_typed = Adw.EntryRow(title="…or type a username")
-        pg.add(self.player_typed)
-        page.add(pg)
+        # ---- player manager
+        self.pm = Adw.PreferencesGroup(title="Players", description="Tick who the player commands are for. "
+                                                                    "⋯ = quick help for just that player.")
+        self.pm.set_header_suffix(row_button("", self.refresh_players, "flat", icon="view-refresh-symbolic"))
+        self.target_row = Adw.ActionRow(title="")
+        self.target_row.add_prefix(Gtk.Image(icon_name="avatar-default-symbolic"))
+        self.pm.add(self.target_row)
+        self.everyone = Adw.SwitchRow(title="Everyone online", subtitle="Player commands go to all online players")
+        self.everyone.connect("notify::active", lambda *_: self._targets_changed())
+        self.pm.add(self.everyone)
+        self.player_typed = Adw.EntryRow(title="Add a player by name (e.g. someone offline)", show_apply_button=True)
+        self.player_typed.connect("apply", lambda *_: self.add_typed())
+        self.pm.add(self.player_typed)
+        page.add(self.pm)
+        self._targets_changed()
 
         # ---- quick help for beginners (one click, things turn themselves off again)
-        qg = Adw.PreferencesGroup(title="Quick help for beginners",
-                                  description="One click for the chosen player. Temporary help switches itself off.")
-        self._quick(qg, "I'm surrounded!", "Zombies ignore you + no damage for 2 minutes — walk away calmly",
-                    lambda u: [f"invisibleplayer {q(u)} -true", f"godmodeplayer {q(u)} -true"],
-                    lambda u: [f"invisibleplayer {q(u)} -false", f"godmodeplayer {q(u)} -false"], 120)
-        self._quick(qg, "I'm hurt", "Medical kit + no damage for 1 minute while you bandage",
-                    lambda u: [f"godmodeplayer {q(u)} -true"] + [f"additem {q(u)} {i} {n}" for i, n in KITS[0][2]],
-                    lambda u: [f"godmodeplayer {q(u)} -false"], 60)
-        self._quick(qg, "I'm stuck / locked door", "Walk through walls for 30 seconds + a crowbar",
-                    lambda u: [f"noclip {q(u)} -true", f"additem {q(u)} Base.Crowbar 1"],
-                    lambda u: [f"noclip {q(u)} -false"], 30)
-        self._quick(qg, "I'm hungry / thirsty", "Food & water kit",
-                    lambda u: [f"additem {q(u)} {i} {n}" for i, n in KITS[1][2]])
-        self._quick(qg, "I need a weapon", "Axe, bat, crowbar, knife",
-                    lambda u: [f"additem {q(u)} {i} {n}" for i, n in KITS[2][2]])
-        self._quick(qg, "I need a car", "Pickup truck next to you + 2 gas cans",
-                    lambda u: [f"addvehicle Base.PickUpTruck {q(u)}", f"additem {q(u)} Base.PetrolCan 2"])
-        self._quick(qg, "It's dark", "Flashlight + batteries + lighter",
-                    lambda u: [f"additem {q(u)} Base.Torch 1", f"additem {q(u)} Base.Battery 4",
-                               f"additem {q(u)} Base.Lighter 1"])
+        qg = Adw.PreferencesGroup(title="Quick help — for the ticked players",
+                                  description="One click. Temporary help switches itself off again.")
+        for key, (title, sub, _on, _off, _sec) in QUICK.items():
+            r = Adw.ActionRow(title=title, subtitle=sub)
+            r.add_suffix(row_button("Help!", lambda k=key: self.quick(k), "suggested-action"))
+            qg.add(r)
         page.add(qg)
 
         # ---- safety
-        sg = Adw.PreferencesGroup(title="Get out of trouble",
+        sg = Adw.PreferencesGroup(title="Get out of trouble — for the ticked players",
                                   description="There is no “heal” command — use God mode + a Medical kit, "
                                               "or Rescue mode while you patch yourself up.")
         self._toggle(sg, "Rescue mode", "Zombies ignore the player AND no damage — perfect to escape a horde",
@@ -1039,7 +1057,7 @@ class ConsolePage(Adw.Bin):
         self._toggle(sg, "God mode", "The player can't be hurt", lambda u, on: [f"godmodeplayer {q(u)} -{on}"])
         self._toggle(sg, "Walk through walls", "No-clip — to get out when stuck",
                      lambda u, on: [f"noclip {q(u)} -{on}"])
-        r = Adw.ActionRow(title="Bring player to another player", subtitle="Teleports the chosen player to…")
+        r = Adw.ActionRow(title="Bring the ticked players to…", subtitle="Teleports them next to this player")
         self.tp_target = Gtk.DropDown(model=Gtk.StringList.new(["(refresh players)"]), valign=Gtk.Align.CENTER)
         r.add_suffix(self.tp_target)
         r.add_suffix(row_button("Teleport", self.teleport))
@@ -1047,7 +1065,8 @@ class ConsolePage(Adw.Bin):
         page.add(sg)
 
         # ---- supplies
-        kg = Adw.PreferencesGroup(title="Give supplies", description="Items go into the player's inventory")
+        kg = Adw.PreferencesGroup(title="Give supplies — to the ticked players",
+                                  description="Items go into each ticked player's inventory")
         for title, sub, items in KITS:
             r = Adw.ActionRow(title=title, subtitle=sub)
             r.add_suffix(row_button("Give", lambda it=items, t=title: self.give(t, it)))
@@ -1081,7 +1100,7 @@ class ConsolePage(Adw.Bin):
         page.add(kg)
 
         # ---- world
-        wg = Adw.PreferencesGroup(title="World & zombies",
+        wg = Adw.PreferencesGroup(title="World & zombies — whole world, all players",
                                   description="To stop zombies coming back to cleared areas: Gameplay → "
                                               "“Zombies come back to cleared areas” → Never")
         self._cmd(wg, "Remove all zombies", "Clears the zombies in the parts of the map that are loaded right now",
@@ -1093,14 +1112,14 @@ class ConsolePage(Adw.Bin):
         page.add(wg)
 
         # ---- server
-        vg = Adw.PreferencesGroup(title="Server")
+        vg = Adw.PreferencesGroup(title="Server — and the ticked players")
         self._cmd(vg, "Save the world", None, "Save", ["save"])
         self._cmd(vg, "Who is online", None, "Show", ["players"])
-        r = Adw.ActionRow(title="Kick the chosen player", subtitle="They can join again")
+        r = Adw.ActionRow(title="Kick the ticked players", subtitle="They can join again")
         r.add_suffix(row_button("Kick", lambda: self.for_player(
             lambda u: [f'kickuser {q(u)} -r "Kicked by host"'], "Kick", confirm=True), "destructive-action"))
         vg.add(r)
-        r = Adw.ActionRow(title="Make the chosen player an admin", subtitle="Gives them the in-game Admin panel")
+        r = Adw.ActionRow(title="Make the ticked players admin", subtitle="Gives them the in-game Admin panel")
         r.add_suffix(row_button("Make admin", lambda: self.for_player(
             lambda u: [f"setaccesslevel {q(u)} admin"], "Admin", confirm=True)))
         vg.add(r)
@@ -1109,14 +1128,15 @@ class ConsolePage(Adw.Bin):
 
         # ---- command library
         lg = Adw.PreferencesGroup(title="More commands",
-                                  description="Pick one (type to search), press Use — it goes into the box below "
-                                              "with the chosen player filled in. Check it, then press ↵ to send.")
+                                  description="Pick one (type to search). Send = run it for every ticked player "
+                                              "(or once, if it isn't about a player). Edit = put it in the box below to change it first.")
         self.lib = searchable_combo("Command", [f"{c} · {t}" for c, t, _, _, _ in COMMANDS])
         self.lib.connect("notify::selected", lambda *_: self.lib_changed())
         lg.add(self.lib)
         self.lib_info = Adw.ActionRow(title="", subtitle="", subtitle_lines=3)
         self.lib_info.add_css_class("property")
-        self.lib_info.add_suffix(row_button("Use", self.lib_use, "suggested-action"))
+        self.lib_info.add_suffix(row_button("Edit", self.lib_use))
+        self.lib_info.add_suffix(row_button("Send", self.lib_send, "suggested-action"))
         lg.add(self.lib_info)
         page.add(lg)
         self.lib_changed()
@@ -1144,20 +1164,17 @@ class ConsolePage(Adw.Bin):
         r.add_suffix(row_button("Off", lambda: self.for_player(lambda u: make(u, "false"), f"{title} OFF")))
         group.add(r)
 
-    def _quick(self, group, title, sub, make_on, make_off=None, seconds=0):
-        r = Adw.ActionRow(title=title, subtitle=sub)
-        r.add_suffix(row_button("Help!", lambda: self.quick(title, make_on, make_off, seconds), "suggested-action"))
-        group.add(r)
-
-    def quick(self, title, make_on, make_off, seconds):
-        u = self.selected_player()
-        if not u:
-            self.app.win.toast("Pick a player first (refresh), or type a username")
+    def quick(self, key, targets=None):
+        title, _sub, make_on, make_off, seconds = QUICK[key]
+        targets = targets or self.targets()
+        if not targets:
+            self.app.win.toast("Tick at least one player first (⟳ to load who is online)")
             return
-        self.run(make_on(u), f"{title} — {u}")
+        who = ", ".join(targets)
+        self.run([c for u in targets for c in make_on(u)], f"{title} → {who}")
         if make_off and seconds:
             def off():
-                self.run(make_off(u), f"{title} — back to normal for {u}")
+                self.run([c for u in targets for c in make_off(u)], f"{title} — back to normal → {who}")
                 return False
             GLib.timeout_add_seconds(seconds, off)
             self.app.win.toast(f"Turns itself off in {seconds} seconds")
@@ -1169,21 +1186,93 @@ class ConsolePage(Adw.Bin):
         r.add_suffix(row_button(label, lambda: self.run(cmds, title, confirm)))
         group.add(r)
 
-    def selected_player(self):
-        typed = self.player_typed.get_text().strip()
-        if typed:
-            return typed
-        i = self.player.get_selected()
-        if self.names and 0 <= i < len(self.names):
-            return self.names[i]
-        return None
+    # ---- player manager
+    def targets(self):
+        """Names the player commands go to right now."""
+        if self.everyone.get_active():
+            return list(self.names)
+        return [n for n, (_r, chk) in self.player_rows.items() if chk.get_active()]
+
+    def _targets_changed(self):
+        t = self.targets()
+        if t:
+            self.target_row.set_title("<b>Commands go to:</b> " + GLib.markup_escape_text(", ".join(t)))
+        else:
+            self.target_row.set_title("<b>Commands go to:</b> nobody yet — tick a player")
+        everyone = self.everyone.get_active()
+        for _n, (_r, chk) in self.player_rows.items():
+            chk.set_sensitive(not everyone)
+
+    def _player_row(self, name, checked, online):
+        r = Adw.ActionRow(title=GLib.markup_escape_text(name),
+                          subtitle="online" if online else "not online right now (added by hand)")
+        chk = Gtk.CheckButton(active=checked, valign=Gtk.Align.CENTER)
+        chk.connect("toggled", lambda *_: self._targets_changed())
+        r.add_prefix(chk)
+        r.set_activatable_widget(chk)
+        menu = Gtk.MenuButton(icon_name="view-more-symbolic", valign=Gtk.Align.CENTER,
+                              tooltip_text=f"Quick help for {name}")
+        menu.add_css_class("flat")
+        pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin_top=6, margin_bottom=6,
+                      margin_start=6, margin_end=6)
+        head = Gtk.Label(label=f"Only for {name}", xalign=0, margin_bottom=4)
+        head.add_css_class("heading")
+        box.append(head)
+
+        def item(label, cb):
+            b = Gtk.Button(label=label)
+            b.add_css_class("flat")
+            b.get_child().set_xalign(0)
+            b.connect("clicked", lambda *_: (pop.popdown(), cb()))
+            box.append(b)
+        for key, (title, *_rest) in QUICK.items():
+            item(title, lambda k=key: self.quick(k, [name]))
+        item("Bring the ticked players here", lambda: self.teleport_to(name))
+        item("Kick", lambda: self.run([f'kickuser {q(name)} -r "Kicked by host"'], f"Kick → {name}", True))
+        pop.set_child(box)
+        menu.set_popover(pop)
+        r.add_suffix(menu)
+        return r, chk
+
+    def _rebuild_players(self, checked):
+        for _n, (r, _c) in self.player_rows.items():
+            self.pm.remove(r)
+        self.pm.remove(self.player_typed)
+        self.player_rows = {}
+        for n in self.names + [e for e in self.extra if e not in self.names]:
+            row, chk = self._player_row(n, n in checked, n in self.names)
+            self.player_rows[n] = (row, chk)
+            self.pm.add(row)
+        if not self.player_rows:
+            empty = Adw.ActionRow(title="Nobody online right now", subtitle="Press ⟳ when your friends are in the game")
+            self.player_rows["\0empty"] = (empty, Gtk.CheckButton())
+            self.pm.add(empty)
+        self.pm.add(self.player_typed)
+        labels = self.names or ["(nobody online)"]
+        self.tp_target.set_model(Gtk.StringList.new(labels))
+        self._targets_changed()
+
+    def add_typed(self):
+        name = self.player_typed.get_text().strip().replace('"', "")
+        if not name:
+            return
+        self.player_typed.set_text("")
+        if name not in self.extra and name not in self.names:
+            self.extra.append(name)
+        checked = set(self.targets()) | {name}
+        self._rebuild_players(checked)
 
     def for_player(self, make, title, confirm=False):
-        u = self.selected_player()
-        if not u:
-            self.app.win.toast("Pick a player first (refresh), or type a username")
+        targets = self.targets()
+        if not targets:
+            self.app.win.toast("Tick at least one player first (⟳ to load who is online)")
             return
-        self.run(make(u), f"{title} — {u}", confirm)
+        cmds = [c for u in targets for c in make(u)]
+        if not cmds:
+            self.app.win.toast("Nothing to do for these players")
+            return
+        self.run(cmds, f"{title} → {', '.join(targets)}", confirm)
 
     def run(self, cmds, title, confirm=False):
         if self.app.status.get("running") != "yes":
@@ -1209,28 +1298,44 @@ class ConsolePage(Adw.Bin):
         self.out_view.scroll_to_mark(self.out.create_mark(None, self.out.get_end_iter(), False), 0, False, 0, 1)
 
     # ---- actions
-    def refresh_players(self):
+    def refresh_players(self, quiet=False):
         if self.app.status.get("running") != "yes":
-            self.app.win.toast("Server is stopped")
+            if not quiet:
+                self.app.win.toast("Server is stopped")
             return
+        before = set(self.targets())
+        first_time = not self.names
 
         def done(rc, out):
             names = [l.strip().lstrip("-").strip() for l in ANSI.sub("", out).splitlines()
                      if l.strip().startswith("-")]
+            if rc != 0 and not names:
+                return
             self.names = names
-            labels = names or ["Nobody online"]
-            self.player.set_model(Gtk.StringList.new(labels))
-            self.tp_target.set_model(Gtk.StringList.new(labels))
-            self.app.win.toast(f"{len(names)} player(s) online")
+            checked = before & (set(names) | set(self.extra))
+            if not checked and first_time and len(names) == 1:
+                checked = {names[0]}               # only one player online → tick them
+            self._rebuild_players(checked)
+            if not quiet:
+                self.app.win.toast(f"{len(names)} player(s) online")
         self.app.with_sudo(lambda: self.app.query(["players"], done))
+
+    def _auto_refresh(self):
+        # every 30 s while the Console tab is open (never asks for the password by itself)
+        if (self.app.pw is not None and self.app.win and self.app.win.stack.get_visible_child() is self
+                and self.app.status.get("running") == "yes"):
+            self.refresh_players(quiet=True)
+        return True
+
+    def teleport_to(self, dest):
+        self.for_player(lambda u: [] if u == dest else [f"teleportplayer {q(u)} {q(dest)}"], f"Bring to {dest}")
 
     def teleport(self):
         i = self.tp_target.get_selected()
         if not self.names or i >= len(self.names):
             self.app.win.toast("Refresh players first")
             return
-        target = self.names[i]
-        self.for_player(lambda u: [f"teleportplayer {q(u)} {q(target)}"], f"Teleport to {target}")
+        self.teleport_to(self.names[i])
 
     def give(self, title, items):
         self.for_player(lambda u: [f"additem {q(u)} {item} {n}" for item, n in items], f"Give {title}")
@@ -1264,19 +1369,30 @@ class ConsolePage(Adw.Bin):
         self.lib_info.set_title(tpl)
         self.lib_info.set_subtitle(("⚠ " if danger else "") + (desc or t))
 
+    def _fill(self, tpl, u):
+        i = self.tp_target.get_selected()
+        p2 = self.names[i] if self.names and i < len(self.names) else "OTHERPLAYER"
+        return tpl.replace("{p2}", q(p2)).replace("{p}", q(u))
+
+    def lib_send(self):
+        _, t, tpl, _, danger = COMMANDS[self.lib.get_selected()]
+        if "{p}" in tpl:
+            self.for_player(lambda u: [self._fill(tpl, u)], t, confirm=danger)
+        else:
+            self.run([tpl], t, confirm=danger)
+
     def lib_use(self):
         _, t, tpl, _, _ = COMMANDS[self.lib.get_selected()]
         if "{p}" in tpl or "{p2}" in tpl:
-            u = self.selected_player()
-            if not u:
-                self.app.win.toast("Pick a player first (refresh), or type a username")
+            targets = self.targets()
+            if not targets:
+                self.app.win.toast("Tick a player first (⟳ to load who is online)")
                 return
-            i = self.tp_target.get_selected()
-            p2 = self.names[i] if self.names and i < len(self.names) else "OTHERPLAYER"
-            tpl = tpl.replace("{p2}", q(p2)).replace("{p}", q(u))
+            tpl = self._fill(tpl, targets[0])
+            if len(targets) > 1:
+                self.app.win.toast(f"Filled in for {targets[0]} — use Send to run it for all {len(targets)} players")
         self.free.set_text(tpl)
         self.free.grab_focus()
-        self.app.win.toast("Check the command, then press ↵ (or the ✓) to send")
 
     def send_free(self):
         cmd = self.free.get_text().strip().lstrip("/")
@@ -1286,8 +1402,11 @@ class ConsolePage(Adw.Bin):
         self.run([cmd], cmd, confirm=cmd.split()[0].lower() in DANGEROUS)
 
     def on_shown(self):
-        if self.app.status.get("running") == "yes" and not self.names:
-            self.refresh_players()
+        if self.app.status.get("running") == "yes":
+            self.refresh_players(quiet=bool(self.names))
+        if not getattr(self, "_auto_on", False):
+            self._auto_on = True
+            GLib.timeout_add_seconds(30, self._auto_refresh)
 
 
 # ---------------------------------------------------------------- More (settings + help)
