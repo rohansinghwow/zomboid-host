@@ -8,7 +8,7 @@
 #          pzhost help       (list all commands)
 # =============================================================================
 
-PZHOST_VERSION="1.3.0"
+PZHOST_VERSION="1.4.0"
 REPO="rohansinghwow/zomboid-host"
 
 # ---- fixed paths -------------------------------------------------------------
@@ -128,6 +128,7 @@ ADMIN_PASSWORD=""
 NETWORK_MODE="tailscale"     # tailscale | portforward
 AUTOSTART="no"
 BACKUP_KEEP_DAYS="7"
+BATTERY_LIMIT="80"           # stop charging at this % (100 = no limit)
 PERMISSION_GRANTED="no"
 INSTALLED="no"
 INSTALLED_BRANCH=""
@@ -138,7 +139,7 @@ save_config() {
   {
     echo "# pzhost config — written $(date '+%F %T'). Keep private (contains passwords)."
     for v in SERVER_NAME PZ_BRANCH XMX SAVE_MINUTES JOIN_PASSWORD ADMIN_PASSWORD NETWORK_MODE \
-             AUTOSTART BACKUP_KEEP_DAYS PERMISSION_GRANTED INSTALLED INSTALLED_BRANCH; do
+             AUTOSTART BACKUP_KEEP_DAYS BATTERY_LIMIT PERMISSION_GRANTED INSTALLED INSTALLED_BRANCH; do
       printf '%s=%q\n' "$v" "${!v}"
     done
   } >"$CONF"
@@ -182,6 +183,9 @@ To host the Zomboid server, this app will make these changes:
                    pzrestart (daily 05:10 restart, only if running)
  ${W}Power settings${N}: laptop will NOT sleep when the lid is closed,
                    sleep/suspend/hibernate are disabled
+ ${W}Laptop server mode${N}: battery stops charging at ${BATTERY_LIMIT}% (if the laptop
+                   supports it), Wi-Fi password stored system-wide so Wi-Fi
+                   connects at boot without login and keeps retrying
  ${W}Firewall${N}: open UDP ${GAME_PORT}-${UDP_PORT} (+ ${TS_PORT} for Tailscale direct)
  ${W}Low-ping tuning${N}: Wi-Fi power saving OFF, bigger UDP buffers (sysctl),
                    server runs at higher priority, "performance" power
@@ -616,6 +620,174 @@ EOF
   ok "Lid close / sleep disabled"
 }
 
+# =============================================================================
+#  Laptop server mode: battery charge limit + Wi-Fi that survives reboots
+# =============================================================================
+BATTERY_SCRIPT="${LIB_DIR}/battery-limit.sh"
+BATTERY_UNIT="${UNIT_DIR}/pzbattery.service"
+
+battery_present() { ls -d /sys/class/power_supply/BAT* >/dev/null 2>&1; }
+on_ac() { grep -qs 1 /sys/class/power_supply/A{C,DP}*/online; }
+battery_limit_now() {  # prints the active limit, or nothing if not supported
+  local b
+  for b in /sys/class/power_supply/BAT*; do
+    [[ -r $b/charge_control_end_threshold ]] && { cat "$b/charge_control_end_threshold"; return 0; }
+  done
+  for b in /sys/bus/platform/drivers/ideapad_acpi/*/conservation_mode; do
+    [[ -r $b ]] && { [[ $(cat "$b") == 1 ]] && echo "conservation" || echo 100; return 0; }
+  done
+  return 1
+}
+battery_supported() { battery_limit_now >/dev/null; }
+
+battery_limit_apply() {  # battery_limit_apply PERCENT (100 = no limit)
+  local pct=${1:-$BATTERY_LIMIT}
+  battery_present || { ok "No battery found — nothing to limit"; return 0; }
+  if ! battery_supported; then
+    warn "This laptop does not let Linux limit battery charging."
+    info "Most laptops have it in the BIOS/UEFI setup instead (press F2/F10/Del at power-on). Look for:"
+    echo "    Dell: 'Primary Battery Charge Configuration' → Custom 50-80%"
+    echo "    HP:   'Battery Health Manager' → Maximize my battery health"
+    echo "    Lenovo: 'Battery conservation' · ASUS: 'Battery Health Charging' · Acer: 'Battery charge limit'"
+    info "Laptop: $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null) $(cat /sys/class/dmi/id/product_name 2>/dev/null)"
+    return 0
+  fi
+  sudo mkdir -p "$LIB_DIR"
+  sudo tee "$BATTERY_SCRIPT" >/dev/null <<'EOF'
+#!/bin/sh
+# pzhost: cap battery charging — the laptop stays plugged in 24/7 as a server.
+# Usage: battery-limit.sh PERCENT   (100 = normal charging)
+END=${1:-80}; START=$((END - 5)); done=0
+for b in /sys/class/power_supply/BAT*; do
+  [ -d "$b" ] || continue
+  if [ -w "$b/charge_types" ] && grep -q Custom "$b/charge_types"; then   # Dell
+    if [ "$END" -lt 100 ]; then echo Custom > "$b/charge_types"; else echo Standard > "$b/charge_types"; fi 2>/dev/null
+  fi
+  if [ -e "$b/charge_control_end_threshold" ]; then
+    # Some drivers need start < end at every moment, so write both twice.
+    for i in 1 2; do
+      echo "$END" > "$b/charge_control_end_threshold" 2>/dev/null
+      [ -e "$b/charge_control_start_threshold" ] && echo "$START" > "$b/charge_control_start_threshold" 2>/dev/null
+    done
+    if [ "$(cat "$b/charge_control_end_threshold")" = "$END" ]; then
+      echo "$(basename "$b"): charging stops at ${END}%"; done=1
+    fi
+  fi
+done
+if [ $done = 0 ]; then
+  for c in /sys/bus/platform/drivers/ideapad_acpi/*/conservation_mode; do   # Lenovo IdeaPad
+    [ -e "$c" ] || continue
+    if [ "$END" -lt 100 ]; then v=1; else v=0; fi
+    echo $v > "$c" && { echo "Lenovo conservation mode = $v (1 = charging stops at about 60-80%)"; done=1; }
+  done
+fi
+[ $done = 1 ] || { echo "Could not set a battery charge limit on this laptop."; exit 2; }
+EOF
+  sudo chmod 755 "$BATTERY_SCRIPT"
+  sudo tee "$BATTERY_UNIT" >/dev/null <<EOF
+[Unit]
+Description=pzhost: limit laptop battery charge to ${pct}%
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=${BATTERY_SCRIPT} ${pct}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  sudo systemctl daemon-reload
+  if [[ $pct -ge 100 ]]; then
+    run sudo "$BATTERY_SCRIPT" 100; sudo systemctl disable pzbattery.service >/dev/null 2>&1
+    ok "Battery charges normally to 100%"
+  else
+    run sudo "$BATTERY_SCRIPT" "$pct" || { warn "The battery driver refused the limit."; return 0; }
+    sudo systemctl enable pzbattery.service >/dev/null 2>&1   # re-applied at every boot
+    ok "Battery limit ${pct}% (kept after reboot). If it is above ${pct}% now, it slowly drains down to it."
+  fi
+}
+
+wifi_system_wide() {  # Wi-Fi connects at boot without anyone logging in, and never gives up retrying
+  command -v nmcli >/dev/null || { ok "NetworkManager not used — skipping"; return 0; }
+  local dev con; dev=$(wifi_iface)
+  [[ -n $dev ]] || { ok "Using a cable (Ethernet) — Wi-Fi setup not needed"; return 0; }
+  con=$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)
+  [[ -n $con ]] || { warn "Wi-Fi is not connected — connect to your Wi-Fi first, then run this again."; return 0; }
+  local args=(connection.autoconnect yes connection.autoconnect-retries 0 connection.permissions "")
+  local km flags psk
+  km=$(nmcli -g 802-11-wireless-security.key-mgmt connection show "$con" 2>/dev/null)
+  flags=$(nmcli -g 802-11-wireless-security.psk-flags connection show "$con" 2>/dev/null)
+  if [[ $km == wpa-psk || $km == sae ]] && [[ -n $flags && $flags != 0* ]]; then
+    # Password lives in the user's keyring → unavailable before login. Store it system-wide.
+    psk=$(nmcli -s -g 802-11-wireless-security.psk connection show "$con" 2>/dev/null)
+    if [[ -n $psk ]]; then args+=(802-11-wireless-security.psk "$psk" 802-11-wireless-security.psk-flags 0)
+    else warn "Could not read the Wi-Fi password (run this from the laptop's desktop, not over SSH)."; fi
+  fi
+  sudo nmcli connection modify "$con" "${args[@]}" || { warn "Could not change the Wi-Fi connection."; return 0; }
+  log INFO "wifi '$con': system-wide, autoconnect, infinite retries"
+  ok "Wi-Fi '${con}' reconnects by itself after reboots and drop-outs (no login needed)"
+}
+
+laptop_mode_apply() {  # setup step — never fails setup, only warns
+  battery_limit_apply "$BATTERY_LIMIT"
+  wifi_system_wide
+  return 0
+}
+
+cmd_laptop() {
+  ensure_permission || return 1
+  while :; do
+    local lim con dev sys="${R}no${N}" wifi="-"
+    lim=$(battery_limit_now) || lim=""
+    [[ $(systemctl is-enabled sleep.target 2>/dev/null) == masked ]] && sys="${G}yes${N}"
+    dev=$(wifi_iface)
+    if [[ -n $dev ]] && command -v nmcli >/dev/null; then
+      con=$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)
+      if [[ -z $(nmcli -g connection.permissions connection show "$con" 2>/dev/null) \
+            && $(nmcli -g 802-11-wireless-security.psk-flags connection show "$con" 2>/dev/null) == 0* ]]; then
+        wifi="${G}${con} — connects at boot, auto-reconnects${N}"
+      else wifi="${Y}${con} — needs a login after reboot (choose 1)${N}"; fi
+    elif [[ -z $dev ]]; then wifi="cable / Ethernet"; fi
+    echo; echo "${W}── Laptop server mode ──${N}"
+    if battery_present; then
+      local cap; cap=$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -1)
+      echo "  Charger         : $(on_ac && echo "${G}plugged in${N}" || echo "${R}NOT plugged in${N}") · battery ${cap}%"
+      case $lim in
+        "") echo "  Charge limit    : ${Y}not supported from Linux — set it in BIOS (choose 1 for help)${N}" ;;
+        100) echo "  Charge limit    : ${Y}off (charges to 100%)${N}" ;;
+        conservation) echo "  Charge limit    : ${G}on (Lenovo conservation mode)${N}" ;;
+        *) echo "  Charge limit    : ${G}${lim}%${N}" ;;
+      esac
+    fi
+    echo "  No sleep / hibernate / lid-close sleep : ${sys}"
+    echo "  Wi-Fi           : ${wifi}"
+    echo "  Server starts on boot : $( [[ $AUTOSTART == yes ]] && echo "${G}yes${N}" || echo "${Y}no${N}")"
+    cat <<EOF
+
+   1) ${W}Make this laptop a server${N} (battery ${BATTERY_LIMIT}%, no sleep, Wi-Fi auto, start on boot)
+   2) Change battery limit (current setting: ${BATTERY_LIMIT}%)
+   0) Back
+
+  ${D}Tip: in the BIOS, set "AC power recovery / Power on AC attach" to ON if it exists —
+  then the laptop turns itself back on after a power cut.${N}
+EOF
+    case $(ask "Choose" 0) in
+      1) step "Battery charge limit" battery_limit_apply "$BATTERY_LIMIT"
+         step "No sleep / hibernate" no_sleep
+         step "Wi-Fi auto-connect" wifi_system_wide
+         if [[ $INSTALLED == yes && $AUTOSTART != yes ]]; then
+           sudo systemctl enable pzserver.service >/dev/null && AUTOSTART=yes && save_config && ok "Server starts automatically on boot"
+         fi ;;
+      2) local p; p=$(ask "Stop charging at (60, 80 recommended, or 100 = no limit)" "$BATTERY_LIMIT")
+         if [[ $p =~ ^[0-9]+$ ]] && (( p >= 50 && p <= 100 )); then
+           BATTERY_LIMIT=$p; save_config; step "Battery charge limit" battery_limit_apply "$p"
+         else warn "Use a number from 50 to 100."; fi ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
 firewall_open() {
   if command -v ufw >/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
     run sudo ufw allow "${GAME_PORT}:${UDP_PORT}/udp" comment 'Project Zomboid' || return 1
@@ -787,6 +959,7 @@ cmd_setup() {
   step "Create world + admin account"     first_run         &&
   step "Configure server (private, auto-save, backups)" configure_ini &&
   step "Keep laptop awake"                no_sleep          &&
+  step "Laptop server mode (battery limit, Wi-Fi)" laptop_mode_apply &&
   step "Firewall"                         firewall_open     &&
   step "Low-ping network tuning"          optimize_network  &&
   step "Network (${NETWORK_MODE})"        network_setup     || { on_fail; return 1; }
@@ -1379,6 +1552,8 @@ cmd_uninstall() {
   server_active && cmd_stop
   sudo systemctl disable --now pzserver.service pzbackup.timer pzrestart.timer 2>/dev/null
   sudo rm -f "${UNIT_DIR}"/pzserver.{service,socket} "${UNIT_DIR}"/pzbackup.{service,timer} "${UNIT_DIR}"/pzrestart.{service,timer}
+  [[ -x $BATTERY_SCRIPT ]] && sudo "$BATTERY_SCRIPT" 100 >/dev/null 2>&1   # back to normal charging
+  sudo systemctl disable pzbattery.service 2>/dev/null; sudo rm -f "$BATTERY_UNIT"
   sudo rm -rf "${UNIT_DIR}/pzserver.service.d" "$LIB_DIR"
   sudo systemctl daemon-reload
   sudo rm -f "$SYSCTL_FILE" "$NM_WIFI_CONF"; sudo systemctl reload NetworkManager 2>/dev/null
@@ -1465,6 +1640,7 @@ cmd_report() {
     section "Ping check" cmd_pingcheck
     section "Network tuning" bash -c "cat '${SYSCTL_FILE}' '${NM_WIFI_CONF}' 2>&1"
     section "Power / sleep" bash -c "cat '${LOGIND_DROPIN}' 2>&1; systemctl is-enabled ${SLEEP_TARGETS[*]} 2>&1"
+    section "Battery" bash -c "cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>&1; grep -H . /sys/class/power_supply/*/{online,capacity,status,charge_control_*_threshold,charge_types} /sys/bus/platform/drivers/ideapad_acpi/*/conservation_mode 2>/dev/null; systemctl is-enabled pzbattery.service 2>&1; true"
     section "pzhost log (last 300 lines)" tail -n 300 "$LOG_FILE"
     section "Server journal (last 250 lines)" sudo -n journalctl -u pzserver.service -n 250 --no-pager -o short-iso
     section "Server console.txt (last 150 lines)" sudo -n tail -n 150 "${ZOMBOID_DIR}/server-console.txt"
@@ -1554,6 +1730,7 @@ EOF
    3) Restart                        9) Restore a backup
    4) ${W}Join info for friends${N}     19) ${W}Gameplay settings${N} (zombies, loot, XP)
                                     20) ${W}Start a new world${N} (reset game)
+                                    21) ${W}Laptop server mode${N} (battery 80%, no sleep)
    5) Status & players            ${W}Help / maintenance${N}
    6) Message all players           10) Live server log
                                     11) Settings
@@ -1570,7 +1747,7 @@ EOF
       1) cmd_start ;; 2) cmd_stop ;; 3) cmd_restart ;; 4) cmd_join ;; 5) cmd_status ;;
       6) cmd_say ;; 7) cmd_save ;; 8) cmd_backup ;; 9) cmd_restore ;; 10) cmd_logs ;;
       11) cmd_settings ;; 12) cmd_netcheck ;; 13) cmd_update_server ;; 14) cmd_report ;;
-      15) cmd_self_update ;; 16) cmd_setup ;; 17) cmd_uninstall ;; 18) cmd_pingcheck ;; 19) cmd_gameplay ;; 20) cmd_newworld ;; 0|q) exit 0 ;;
+      15) cmd_self_update ;; 16) cmd_setup ;; 17) cmd_uninstall ;; 18) cmd_pingcheck ;; 19) cmd_gameplay ;; 20) cmd_newworld ;; 21) cmd_laptop ;; 0|q) exit 0 ;;
       *) warn "Unknown choice." ;;
     esac
     pause
@@ -1597,6 +1774,7 @@ pzhost ${PZHOST_VERSION} — Project Zomboid server manager for Debian 13 / Ubun
   pzhost gameplay        gameplay settings: zombies, loot, XP (beginner preset)
   pzhost netcheck        Jio CGNAT / port forwarding check
   pzhost ping            ping / Wi-Fi / Tailscale direct-vs-relay check
+  pzhost laptop          laptop server mode: battery limit, no sleep, Wi-Fi auto-connect
   pzhost update-server   change/update the game server version
   pzhost report          send an error report to GitHub
   pzhost self-update     update this app from GitHub
@@ -1632,6 +1810,7 @@ main() {
     gameplay|sandbox) cmd_gameplay ;;
     netcheck)      cmd_netcheck ;;
     ping|pingcheck) cmd_pingcheck ;;
+    laptop|battery) cmd_laptop ;;
     update-server) cmd_update_server ;;
     report)        cmd_report ;;
     self-update|update) cmd_self_update ;;

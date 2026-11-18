@@ -52,6 +52,7 @@ Next time, open **Zomboid Host** from the app menu / desktop icon, or type `pzho
 | Check ping / Wi-Fi / Tailscale direct vs relay | **18) Ping check** |
 | Change zombies, loot, XP, day length (has a **Beginner** preset) | **19) Gameplay settings** |
 | Start the game over on a fresh map (keeps accounts + settings, old world kept) | **20) Start a new world** |
+| Battery stops at 80%, no sleep, Wi-Fi reconnects by itself, server starts on boot | **21) Laptop server mode** |
 | Something broke | **14) Send error report** |
 | Get the fix | **15) Update this app** |
 
@@ -80,6 +81,8 @@ The host sends you the join info. In short:
 | `pzserver.service` + `.socket` | runs server, clean save on stop, console commands | uninstall |
 | `pzbackup.timer` (05:00), `pzrestart.timer` (05:10) | daily backup (7 days kept), daily restart | uninstall |
 | Lid-close ignored, sleep targets masked | laptop keeps hosting | uninstall |
+| `pzbattery.service`: charging stops at 80% (if the laptop supports it from Linux, otherwise BIOS help is shown) | battery lasts years plugged in 24/7 | uninstall (back to 100%) |
+| Current Wi-Fi connection: password stored system-wide, auto-connect, unlimited retries | Wi-Fi works after reboot without login | NetworkManager settings |
 | UDP 16261-16262 (+41641 Tailscale) in ufw/firewalld | friends can connect | uninstall |
 | `/etc/sysctl.d/90-pzhost.conf`, Wi-Fi power-save off, server `Nice=-5`, performance profile while running | lower, steadier ping | uninstall |
 | `servertest.ini`: private, password, auto-save every 10 min, built-in backups | safety | settings |
@@ -108,6 +111,7 @@ pzhost say "text"      message all players
 pzhost save|backup|restore
 pzhost new-world       fresh map, new characters (old world moved to ~pz/Zomboid/old-worlds)
 pzhost ping            ping / Wi-Fi / Tailscale check
+pzhost laptop          battery limit / no sleep / Wi-Fi auto-connect
 pzhost netcheck        Jio CGNAT check
 pzhost gameplay        zombies / loot / XP / beginner preset
 pzhost settings|update-server|report|self-update|uninstall
