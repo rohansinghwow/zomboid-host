@@ -8,7 +8,7 @@
 #          pzhost help       (list all commands)
 # =============================================================================
 
-PZHOST_VERSION="1.2.0"
+PZHOST_VERSION="1.3.0"
 REPO="rohansinghwow/zomboid-host"
 
 # ---- fixed paths -------------------------------------------------------------
@@ -961,6 +961,57 @@ cmd_restore() {
   [[ $was == yes ]] && cmd_start
 }
 
+# New game: fresh map + characters. Keeps accounts (Zomboid/db), server settings
+# and gameplay settings. The old world is moved, never deleted.
+cmd_newworld() {
+  require_installed || return 1; ensure_permission || return 1
+  local save="${ZOMBOID_DIR}/Saves/Multiplayer/${SERVER_NAME}"
+  local old="${ZOMBOID_DIR}/old-worlds/${SERVER_NAME}-$(date +%F_%H%M%S)"
+  cat <<EOF
+
+${W}── Start a new world ──${N}
+  This starts the game over: ${W}new map, everyone makes a new character${N},
+  all houses / items / zombies are reset.
+
+  ${G}Kept:${N} usernames + passwords, join password, server and gameplay settings.
+  ${G}Safe:${N} a backup is made first and the old world is moved to
+        ${old}
+        (not deleted — it can be put back).
+EOF
+  local a; read -r -p "Type ${W}NEW${N} to start a new world (anything else = cancel): " a
+  [[ $a == NEW || $a == new ]] || { info "Cancelled — nothing changed."; return 0; }
+
+  if ! as_pz test -d "$save"; then
+    err "World folder not found: $save"
+    info "Saved worlds on this server:"; as_pz ls -1 "${ZOMBOID_DIR}/Saves/Multiplayer" 2>/dev/null | sed 's/^/    /'
+    LAST_ERROR="New world"; return 1
+  fi
+  if server_active; then
+    send_console 'servermsg "Server is restarting with a NEW WORLD. Make a new character when it is back."' 2>/dev/null
+    sleep 3
+  fi
+  step "Stop server (saves the old world)" cmd_stop \
+    && step "Backup old world" cmd_backup \
+    && step "Move old world aside" as_pz bash -c "mkdir -p '${ZOMBOID_DIR}/old-worlds' && mv '$save' '$old'" \
+    || { on_fail; return 1; }
+  ok "Old world kept in ${old}"
+  log INFO "new world: old save moved to $old"
+
+  if ask_yn "Change gameplay settings first? (e.g. the Beginner preset — best done before the world is made)" y; then
+    cmd_gameplay
+  fi
+  if ask_yn "Start the server and create the new world now? (first start takes a few extra minutes)" y; then
+    cmd_start
+  else
+    info "The new world is created the next time you choose 1) Start."
+  fi
+  echo
+  info "To put the old world back: stop the server, then run"
+  echo "    sudo -u ${PZ_USER} mv '${save}' '${save}-new-$(date +%F)'"
+  echo "    sudo -u ${PZ_USER} mv '${old}' '${save}'"
+  info "Old worlds use disk space. Delete ones you don't need with:  sudo rm -r '${ZOMBOID_DIR}/old-worlds/<name>'"
+}
+
 # =============================================================================
 #  Network check (Jio CGNAT)
 # =============================================================================
@@ -1502,6 +1553,7 @@ EOF
    2) Stop                           8) Backup now
    3) Restart                        9) Restore a backup
    4) ${W}Join info for friends${N}     19) ${W}Gameplay settings${N} (zombies, loot, XP)
+                                    20) ${W}Start a new world${N} (reset game)
    5) Status & players            ${W}Help / maintenance${N}
    6) Message all players           10) Live server log
                                     11) Settings
@@ -1518,7 +1570,7 @@ EOF
       1) cmd_start ;; 2) cmd_stop ;; 3) cmd_restart ;; 4) cmd_join ;; 5) cmd_status ;;
       6) cmd_say ;; 7) cmd_save ;; 8) cmd_backup ;; 9) cmd_restore ;; 10) cmd_logs ;;
       11) cmd_settings ;; 12) cmd_netcheck ;; 13) cmd_update_server ;; 14) cmd_report ;;
-      15) cmd_self_update ;; 16) cmd_setup ;; 17) cmd_uninstall ;; 18) cmd_pingcheck ;; 19) cmd_gameplay ;; 0|q) exit 0 ;;
+      15) cmd_self_update ;; 16) cmd_setup ;; 17) cmd_uninstall ;; 18) cmd_pingcheck ;; 19) cmd_gameplay ;; 20) cmd_newworld ;; 0|q) exit 0 ;;
       *) warn "Unknown choice." ;;
     esac
     pause
@@ -1539,6 +1591,7 @@ pzhost ${PZHOST_VERSION} — Project Zomboid server manager for Debian 13 / Ubun
   pzhost save            save world now
   pzhost backup          backup now
   pzhost restore         restore a backup
+  pzhost new-world       start the game over on a fresh map (keeps accounts + settings)
   pzhost logs            live server log
   pzhost settings        change passwords, memory, version, network
   pzhost gameplay        gameplay settings: zombies, loot, XP (beginner preset)
@@ -1573,6 +1626,7 @@ main() {
     save)          cmd_save ;;
     backup)        cmd_backup ;;
     restore)       cmd_restore ;;
+    new-world|newworld|reset) cmd_newworld ;;
     logs|log)      cmd_logs ;;
     settings)      cmd_settings ;;
     gameplay|sandbox) cmd_gameplay ;;

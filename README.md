@@ -51,6 +51,7 @@ Next time, open **Zomboid Host** from the app menu / desktop icon, or type `pzho
 | Save right now | 7 |
 | Check ping / Wi-Fi / Tailscale direct vs relay | **18) Ping check** |
 | Change zombies, loot, XP, day length (has a **Beginner** preset) | **19) Gameplay settings** |
+| Start the game over on a fresh map (keeps accounts + settings, old world kept) | **20) Start a new world** |
 | Something broke | **14) Send error report** |
 | Get the fix | **15) Update this app** |
 
@@ -105,6 +106,7 @@ pzhost setup           install / repair
 pzhost start|stop|restart|status|players|join
 pzhost say "text"      message all players
 pzhost save|backup|restore
+pzhost new-world       fresh map, new characters (old world moved to ~pz/Zomboid/old-worlds)
 pzhost ping            ping / Wi-Fi / Tailscale check
 pzhost netcheck        Jio CGNAT check
 pzhost gameplay        zombies / loot / XP / beginner preset
