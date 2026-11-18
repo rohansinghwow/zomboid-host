@@ -8,7 +8,7 @@
 #          pzhost help       (list all commands)
 # =============================================================================
 
-PZHOST_VERSION="1.4.0"
+PZHOST_VERSION="1.5.0"
 REPO="rohansinghwow/zomboid-host"
 
 # ---- fixed paths -------------------------------------------------------------
@@ -40,6 +40,13 @@ set -o pipefail
 set -E
 # Debian keeps ufw, sysctl, iw, useradd in sbin, which is not in a normal user's PATH.
 export PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
+
+# ---- GUI mode (pzhost-gui runs pzhost with PZHOST_GUI=1, stdin = /dev/null) ----
+# sudo then gets the password from the app's password dialog through SUDO_ASKPASS,
+# and every question silently takes its default (the app asks the user itself).
+if [[ ${PZHOST_GUI:-} == 1 ]]; then
+  sudo() { command sudo -A "$@"; }
+fi
 
 # ---- distro detection -------------------------------------------------------
 OS_ID=$(. /etc/os-release 2>/dev/null && echo "${ID:-} ${ID_LIKE:-}")
@@ -185,7 +192,9 @@ To host the Zomboid server, this app will make these changes:
                    sleep/suspend/hibernate are disabled
  ${W}Laptop server mode${N}: battery stops charging at ${BATTERY_LIMIT}% (if the laptop
                    supports it), Wi-Fi password stored system-wide so Wi-Fi
-                   connects at boot without login and keeps retrying
+                   connects at boot without login and keeps retrying,
+                   Wi-Fi power saving off (also in the Wi-Fi driver), and a
+                   watchdog that reconnects Wi-Fi if the internet drops
  ${W}Firewall${N}: open UDP ${GAME_PORT}-${UDP_PORT} (+ ${TS_PORT} for Tailscale direct)
  ${W}Low-ping tuning${N}: Wi-Fi power saving OFF, bigger UDP buffers (sysctl),
                    server runs at higher priority, "performance" power
@@ -200,6 +209,9 @@ EOF
 }
 
 ensure_permission() {
+  if [[ $PERMISSION_GRANTED != yes && ${PZHOST_GUI:-} == 1 && ${PZHOST_GRANT:-} == yes ]]; then
+    PERMISSION_GRANTED=yes; save_config; log INFO "Permission granted in the app by user $(id -un)"
+  fi
   if [[ $PERMISSION_GRANTED != yes ]]; then
     show_permission_screen
     local a; read -r -p "Type ${W}yes${N} to allow all of the above: " a
@@ -279,6 +291,20 @@ setup_questions() {
   [[ $n == 2 ]] && NETWORK_MODE=portforward || NETWORK_MODE=tailscale
 
   ask_yn "Start the server automatically when the laptop boots?" n && AUTOSTART=yes || AUTOSTART=no
+  save_config
+}
+
+setup_from_gui() {  # answers come from the app's setup form (environment variables)
+  [[ -n ${GUI_BRANCH:-} ]] && { [[ $GUI_BRANCH =~ ^[A-Za-z0-9._-]+$ ]] || { err "Bad game version"; return 1; }; PZ_BRANCH=$GUI_BRANCH; }
+  [[ -n ${GUI_XMX:-} ]] && { [[ $GUI_XMX =~ ^[0-9]+[gm]$ ]] || { err "Bad memory value"; return 1; }; XMX=$GUI_XMX; }
+  [[ -n ${GUI_JOIN_PASSWORD:-} ]] && JOIN_PASSWORD=$GUI_JOIN_PASSWORD
+  [[ -n ${GUI_ADMIN_PASSWORD:-} && -z $ADMIN_PASSWORD ]] && ADMIN_PASSWORD=$GUI_ADMIN_PASSWORD
+  [[ ${GUI_NETWORK:-} =~ ^(tailscale|portforward)$ ]] && NETWORK_MODE=$GUI_NETWORK
+  [[ ${GUI_AUTOSTART:-} =~ ^(yes|no)$ ]] && AUTOSTART=$GUI_AUTOSTART
+  local p
+  for p in "$JOIN_PASSWORD" "$ADMIN_PASSWORD"; do
+    [[ $p =~ ^[A-Za-z0-9_-]{4,32}$ ]] || { err "Passwords must be 4-32 letters, digits, - or _"; return 1; }
+  done
   save_config
 }
 
@@ -729,10 +755,196 @@ wifi_system_wide() {  # Wi-Fi connects at boot without anyone logging in, and ne
   ok "Wi-Fi '${con}' reconnects by itself after reboots and drop-outs (no login needed)"
 }
 
+WIFI_MODPROBE="/etc/modprobe.d/pzhost-wifi.conf"
+WIFI_WATCHDOG="${LIB_DIR}/wifi-watchdog.sh"
+
+wifi_stability() {  # Wi-Fi must never doze off or stay dead
+  local w con drv opts=""
+  w=$(wifi_iface)
+  if [[ -z $w ]] && command -v nmcli >/dev/null; then
+    w=$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')
+  fi
+  [[ -n $w ]] || { ok "No Wi-Fi adapter in use — nothing to do"; return 0; }
+  # 1) power saving off for this exact connection (on top of the global NetworkManager setting)
+  if command -v nmcli >/dev/null; then
+    con=$(nmcli -g GENERAL.CONNECTION device show "$w" 2>/dev/null)
+    [[ -n $con ]] && sudo nmcli connection modify "$con" 802-11-wireless.powersave 2 2>/dev/null \
+      && ok "Wi-Fi power saving off for '${con}'"
+  fi
+  command -v iw >/dev/null && sudo iw dev "$w" set power_save off 2>/dev/null
+  # 2) power saving off inside the Wi-Fi chip driver (fully active after the next reboot)
+  drv=$(basename "$(readlink -f "/sys/class/net/$w/device/driver" 2>/dev/null)" 2>/dev/null)
+  case $drv in
+    iwlwifi)         opts=$'options iwlwifi power_save=0\noptions iwlmvm power_scheme=1' ;;
+    rtw88_*)         opts=$'options rtw88_pci disable_aspm=1\noptions rtw88_core disable_lps_deep=1' ;;
+    rtw89_*)         opts=$'options rtw89_pci disable_aspm_l1=1 disable_aspm_l1ss=1\noptions rtw89_core disable_ps_mode=1' ;;
+    mt7921e|mt7925e) opts="options ${drv} disable_aspm=1" ;;
+  esac
+  if [[ -n $opts ]]; then
+    printf '# pzhost: keep the Wi-Fi chip fully awake (server)\n%s\n' "$opts" | sudo tee "$WIFI_MODPROBE" >/dev/null
+    ok "Wi-Fi chip (${drv}) power saving off — fully active after the next reboot"
+  else
+    info "Wi-Fi chip driver: ${drv:-unknown} (no extra driver tweak needed)"
+  fi
+  # 3) watchdog: if the internet is gone for ~3 minutes, reconnect Wi-Fi by itself
+  sudo mkdir -p "$LIB_DIR"
+  sudo tee "$WIFI_WATCHDOG" >/dev/null <<'EOF'
+#!/bin/sh
+# pzhost Wi-Fi watchdog (runs every minute). If Wi-Fi is the connection in use and
+# neither the router nor the internet answers for 3 checks in a row, reconnect it.
+STATE=/run/pzhost-wifi-fails
+dev=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+[ -n "$dev" ] || dev=$(nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')
+if [ -z "$dev" ] || [ ! -d "/sys/class/net/$dev/wireless" ]; then rm -f "$STATE"; exit 0; fi
+gw=$(ip -4 route show default dev "$dev" 2>/dev/null | awk '{print $3; exit}')
+if { [ -n "$gw" ] && ping -n -c 2 -W 3 "$gw" >/dev/null 2>&1; } || ping -n -c 2 -W 3 1.1.1.1 >/dev/null 2>&1; then
+  [ -f "$STATE" ] && echo "Connection is back."
+  rm -f "$STATE"; exit 0
+fi
+n=$(( $(cat "$STATE" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STATE"
+echo "No connection on $dev (check $n)"
+nmcli radio wifi on 2>/dev/null
+if [ "$n" -eq 3 ] || [ $(( n % 10 )) -eq 0 ]; then
+  echo "Reconnecting Wi-Fi $dev"; nmcli device disconnect "$dev" >/dev/null 2>&1; sleep 2; nmcli device connect "$dev"
+elif [ "$n" -eq 6 ]; then
+  echo "Restarting NetworkManager"; systemctl restart NetworkManager
+fi
+exit 0
+EOF
+  sudo chmod 755 "$WIFI_WATCHDOG"
+  sudo tee "${UNIT_DIR}/pzwifi-watchdog.service" >/dev/null <<EOF
+[Unit]
+Description=pzhost: reconnect Wi-Fi if the internet is down
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=${WIFI_WATCHDOG}
+EOF
+  sudo tee "${UNIT_DIR}/pzwifi-watchdog.timer" >/dev/null <<'EOF'
+[Unit]
+Description=pzhost: Wi-Fi watchdog every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+  sudo systemctl daemon-reload
+  run sudo systemctl enable --now pzwifi-watchdog.timer || return 0
+  ok "Wi-Fi watchdog on: reconnects by itself if the internet drops for ~3 minutes"
+  return 0
+}
+
 laptop_mode_apply() {  # setup step — never fails setup, only warns
   battery_limit_apply "$BATTERY_LIMIT"
   wifi_system_wide
+  wifi_stability
   return 0
+}
+
+cmd_laptop_apply() {  # "Make this laptop a server" (menu + GUI)
+  ensure_permission || return 1
+  step "Battery charge limit" battery_limit_apply "$BATTERY_LIMIT"
+  step "No sleep / hibernate" no_sleep
+  step "Wi-Fi auto-connect" wifi_system_wide
+  step "Wi-Fi never sleeps + watchdog" wifi_stability
+  if [[ $INSTALLED == yes && $AUTOSTART != yes ]]; then
+    sudo systemctl enable pzserver.service >/dev/null && AUTOSTART=yes && save_config && ok "Server starts automatically on boot"
+  fi
+  return 0
+}
+
+cmd_laptop_limit() {
+  ensure_permission || return 1
+  local p=$1
+  [[ $p =~ ^[0-9]+$ ]] && (( p >= 50 && p <= 100 )) || { err "Use a number from 50 to 100."; return 1; }
+  BATTERY_LIMIT=$p; save_config; battery_limit_apply "$p"
+}
+
+wifi_status_kv() {  # prints wifi_* key=value lines (no sudo needed)
+  local dev con
+  dev=$(wifi_iface)
+  if [[ -z $dev ]]; then
+    if ip -4 route show default 2>/dev/null | grep -q .; then echo "wifi=cable"; else echo "wifi=offline"; fi
+    return 0
+  fi
+  command -v nmcli >/dev/null || { echo "wifi=${dev}"; return 0; }
+  con=$(nmcli -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)
+  echo "wifi=${con:-?}"
+  if [[ -z $(nmcli -g connection.permissions connection show "$con" 2>/dev/null) \
+        && $(nmcli -g 802-11-wireless-security.psk-flags connection show "$con" 2>/dev/null) == 0* ]]; then
+    echo "wifi_boot=yes"; else echo "wifi_boot=no"; fi
+  if [[ $(nmcli -g 802-11-wireless.powersave connection show "$con" 2>/dev/null) == 2* || -f $NM_WIFI_CONF ]]; then
+    echo "wifi_powersave=off"; else echo "wifi_powersave=on"; fi
+  echo "wifi_signal=$(nmcli -t -f IN-USE,SIGNAL device wifi list --rescan no 2>/dev/null | awk -F: '$1=="*"{print $2; exit}')"
+}
+
+cmd_gui_status() {  # one-shot status for the GUI (key=value, no sudo)
+  local lim
+  echo "app_version=${PZHOST_VERSION}"
+  echo "installed=${INSTALLED:-no}"
+  echo "permission=${PERMISSION_GRANTED:-no}"
+  if server_active; then echo "running=yes"; else echo "running=no"; fi
+  echo "since=$(systemctl show -p ActiveEnterTimestamp --value pzserver.service 2>/dev/null)"
+  echo "branch=${PZ_BRANCH}"
+  echo "memory=${XMX}"
+  echo "autosave=${SAVE_MINUTES}"
+  echo "autostart=${AUTOSTART}"
+  echo "network=${NETWORK_MODE}"
+  if [[ $NETWORK_MODE == tailscale ]]; then echo "ip=$(tailscale_ip)"; else echo "ip=$(public_ip)"; fi
+  echo "port=${GAME_PORT}"
+  echo "join_password=${JOIN_PASSWORD}"
+  echo "ram_gb=$(total_ram_gb)"
+  if battery_present; then
+    echo "battery=$(cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -1)"
+    if on_ac; then echo "ac=yes"; else echo "ac=no"; fi
+    lim=$(battery_limit_now) || lim=unsupported
+    echo "limit_now=${lim}"
+  else
+    echo "battery="
+  fi
+  echo "limit_setting=${BATTERY_LIMIT}"
+  if [[ $(systemctl is-enabled sleep.target 2>/dev/null) == masked ]]; then echo "nosleep=yes"; else echo "nosleep=no"; fi
+  if systemctl is-enabled -q pzwifi-watchdog.timer 2>/dev/null; then echo "watchdog=yes"; else echo "watchdog=no"; fi
+  wifi_status_kv
+  return 0
+}
+
+cmd_set() {  # pzhost set KEY VALUE  (join-password reads PZHOST_VALUE so it never shows in ps)
+  require_installed || return 1; ensure_permission || return 1
+  local k=${1:-} v=${2:-${PZHOST_VALUE:-}}
+  case $k in
+    join-password)
+      [[ $v =~ ^[A-Za-z0-9_-]{4,32}$ ]] || { err "Password: 4-32 letters, digits, - or _"; return 1; }
+      JOIN_PASSWORD=$v; save_config; configure_ini && ok "Join password changed."; apply_change_restart ;;
+    memory)
+      [[ $v =~ ^[0-9]+[gm]$ ]] || { err "Memory like 6g"; return 1; }
+      XMX=$v; save_config; set_xmx && ok "Server memory ${v}."; apply_change_restart ;;
+    autosave)
+      [[ $v =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 120 )) || { err "Minutes 1-120"; return 1; }
+      SAVE_MINUTES=$v; save_config; configure_ini && ok "Auto-save every ${v} min."; apply_change_restart ;;
+    autostart)
+      if [[ $v == yes ]]; then sudo systemctl enable pzserver.service && AUTOSTART=yes
+      else sudo systemctl disable pzserver.service && AUTOSTART=no; fi
+      save_config; ok "Start on boot: ${AUTOSTART}" ;;
+    network)
+      [[ $v =~ ^(tailscale|portforward)$ ]] || { err "tailscale or portforward"; return 1; }
+      NETWORK_MODE=$v; save_config
+      step "Install packages" install_packages && step "Firewall" firewall_open && step "Network" network_setup || { on_fail; return 1; } ;;
+    version)
+      [[ $v =~ ^[A-Za-z0-9._-]+$ ]] || { err "Bad version"; return 1; }
+      PZ_BRANCH=$v; save_config; cmd_update_server ;;
+    *) err "Unknown setting: $k"; return 1 ;;
+  esac
+}
+
+cmd_gui_log() {  # last server log lines (GUI)
+  sudo_start >/dev/null || return 1
+  sudo journalctl -q -u pzserver.service -n "${1:-300}" -o cat --no-pager
 }
 
 cmd_laptop() {
@@ -765,7 +977,8 @@ cmd_laptop() {
     echo "  Server starts on boot : $( [[ $AUTOSTART == yes ]] && echo "${G}yes${N}" || echo "${Y}no${N}")"
     cat <<EOF
 
-   1) ${W}Make this laptop a server${N} (battery ${BATTERY_LIMIT}%, no sleep, Wi-Fi auto, start on boot)
+   1) ${W}Make this laptop a server${N} (battery ${BATTERY_LIMIT}%, no sleep, Wi-Fi never sleeps +
+      auto-reconnect, server starts on boot)
    2) Change battery limit (current setting: ${BATTERY_LIMIT}%)
    0) Back
 
@@ -773,12 +986,7 @@ cmd_laptop() {
   then the laptop turns itself back on after a power cut.${N}
 EOF
     case $(ask "Choose" 0) in
-      1) step "Battery charge limit" battery_limit_apply "$BATTERY_LIMIT"
-         step "No sleep / hibernate" no_sleep
-         step "Wi-Fi auto-connect" wifi_system_wide
-         if [[ $INSTALLED == yes && $AUTOSTART != yes ]]; then
-           sudo systemctl enable pzserver.service >/dev/null && AUTOSTART=yes && save_config && ok "Server starts automatically on boot"
-         fi ;;
+      1) cmd_laptop_apply ;;
       2) local p; p=$(ask "Stop charging at (60, 80 recommended, or 100 = no limit)" "$BATTERY_LIMIT")
          if [[ $p =~ ^[0-9]+$ ]] && (( p >= 50 && p <= 100 )); then
            BATTERY_LIMIT=$p; save_config; step "Battery charge limit" battery_limit_apply "$p"
@@ -942,7 +1150,9 @@ cmd_setup() {
   ensure_permission || return 1
   local fresh=no
   [[ -z $JOIN_PASSWORD || -z $ADMIN_PASSWORD || $INSTALLED != yes ]] && fresh=yes
-  if [[ $fresh == yes ]] || ask_yn "Review the setup answers (version, RAM, passwords, network)?" n; then
+  if [[ ${PZHOST_GUI:-} == 1 ]]; then
+    setup_from_gui || return 1
+  elif [[ $fresh == yes ]] || ask_yn "Review the setup answers (version, RAM, passwords, network)?" n; then
     setup_questions
   fi
   log INFO "setup: branch=${PZ_BRANCH} xmx=${XMX} save=${SAVE_MINUTES} net=${NETWORK_MODE} autostart=${AUTOSTART}"
@@ -1112,18 +1322,32 @@ cmd_backup() {
   (( rc == 0 )) && ok "Backup done." || { LAST_ERROR="Backup"; on_fail; return 1; }
 }
 
-cmd_restore() {
+cmd_backups_list() {  # for the GUI: name|size|date, newest first
+  sudo_start || return 1
+  sudo find "$BACKUP_DIR" -maxdepth 1 -name 'pz-*.tar.gz' -printf '%T@|%f|%s\n' 2>/dev/null | sort -rn \
+    | while IFS='|' read -r t f sz; do
+        printf '%s|%s|%s\n' "$f" "$(numfmt --to=iec "$sz" 2>/dev/null || echo "$sz")" "$(date -d "@${t%.*}" '+%a %d %b %Y, %H:%M')"
+      done
+}
+
+cmd_restore() {  # pzhost restore [pz-….tar.gz --yes]
   require_installed || return 1; sudo_start || return 1
-  local files=() i n
-  mapfile -t files < <(sudo ls -1t "$BACKUP_DIR"/pz-*.tar.gz 2>/dev/null)
-  (( ${#files[@]} )) || { warn "No backups found in ${BACKUP_DIR}."; return 0; }
-  echo "${W}Backups (newest first):${N}"
-  for i in "${!files[@]}"; do echo "  $((i+1))) $(basename "${files[$i]}")"; done
-  n=$(ask "Restore which one (0 = cancel)" 0)
-  [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#files[@]} )) || { info "Cancelled."; return 0; }
-  local f=${files[$((n-1))]}
+  local files=() i n f="" yes=no
+  [[ ${2:-} == --yes ]] && yes=yes
+  if [[ -n ${1:-} ]]; then
+    [[ $1 =~ ^pz-[0-9_-]+\.tar\.gz$ ]] && sudo test -f "$BACKUP_DIR/$1" || { err "Backup not found: $1"; return 1; }
+    f="$BACKUP_DIR/$1"
+  else
+    mapfile -t files < <(sudo ls -1t "$BACKUP_DIR"/pz-*.tar.gz 2>/dev/null)
+    (( ${#files[@]} )) || { warn "No backups found in ${BACKUP_DIR}."; return 0; }
+    echo "${W}Backups (newest first):${N}"
+    for i in "${!files[@]}"; do echo "  $((i+1))) $(basename "${files[$i]}")"; done
+    n=$(ask "Restore which one (0 = cancel)" 0)
+    [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#files[@]} )) || { info "Cancelled."; return 0; }
+    f=${files[$((n-1))]}
+  fi
   warn "This REPLACES the current world with $(basename "$f")."
-  ask_yn "Continue? (the current world is backed up first)" n || return 0
+  [[ $yes == yes ]] || ask_yn "Continue? (the current world is backed up first)" n || return 0
   local was=no; server_active && was=yes
   cmd_stop || return 1
   cmd_backup || return 1
@@ -1136,7 +1360,11 @@ cmd_restore() {
 
 # New game: fresh map + characters. Keeps accounts (Zomboid/db), server settings
 # and gameplay settings. The old world is moved, never deleted.
-cmd_newworld() {
+cmd_newworld() {  # flags: --yes (no typing NEW), --preset beginner|normal|hard, --no-start
+  local yes=no preset="" start=yes
+  while (( $# )); do
+    case $1 in --yes) yes=yes ;; --preset) preset=${2:-}; shift ;; --no-start) start=no ;; esac; shift
+  done
   require_installed || return 1; ensure_permission || return 1
   local save="${ZOMBOID_DIR}/Saves/Multiplayer/${SERVER_NAME}"
   local old="${ZOMBOID_DIR}/old-worlds/${SERVER_NAME}-$(date +%F_%H%M%S)"
@@ -1151,8 +1379,10 @@ ${W}── Start a new world ──${N}
         ${old}
         (not deleted — it can be put back).
 EOF
-  local a; read -r -p "Type ${W}NEW${N} to start a new world (anything else = cancel): " a
-  [[ $a == NEW || $a == new ]] || { info "Cancelled — nothing changed."; return 0; }
+  if [[ $yes != yes ]]; then
+    local a; read -r -p "Type ${W}NEW${N} to start a new world (anything else = cancel): " a
+    [[ $a == NEW || $a == new ]] || { info "Cancelled — nothing changed."; return 0; }
+  fi
 
   if ! as_pz test -d "$save"; then
     err "World folder not found: $save"
@@ -1170,10 +1400,13 @@ EOF
   ok "Old world kept in ${old}"
   log INFO "new world: old save moved to $old"
 
-  if ask_yn "Change gameplay settings first? (e.g. the Beginner preset — best done before the world is made)" y; then
+  if [[ -n $preset ]]; then
+    gp_load && gp_apply_kv preset "$preset" && gp_save && ok "Gameplay preset '${preset}' applied"
+    rm -f "$GP_TMP"
+  elif [[ $yes != yes ]] && ask_yn "Change gameplay settings first? (e.g. the Beginner preset — best done before the world is made)" y; then
     cmd_gameplay
   fi
-  if ask_yn "Start the server and create the new world now? (first start takes a few extra minutes)" y; then
+  if [[ $start == yes ]] && ask_yn "Start the server and create the new world now? (first start takes a few extra minutes)" y; then
     cmd_start
   else
     info "The new world is created the next time you choose 1) Start."
@@ -1420,17 +1653,78 @@ gp_save() {
   else info "They will be used the next time you start the server."; fi
 }
 
-cmd_gameplay() {
-  require_installed || return 1; ensure_permission || return 1
+gp_load() {  # copy the sandbox file into a private working copy ($GP_TMP)
   local f; f=$(sandbox_file)
   if ! as_pz test -f "$f"; then
     err "Gameplay settings file not found: $f"
-    info "Run 16) Repair once so the server creates its world, then try again."
+    info "Run Repair (re-run setup) once so the server creates its world, then try again."
     return 1
   fi
   GP_TMP=$(mktemp "${STATE_DIR}/sandbox.XXXXXX") || return 1
   as_pz cat "$f" >"$GP_TMP" || { err "Could not read $f"; rm -f "$GP_TMP"; return 1; }
-  GP_DIRTY=no
+  GP_DIRTY=no; GP_SKIPPED=()
+}
+
+gp_apply_kv() {  # gp_apply_kv KEY VALUE — one option by its short name (used by the GUI)
+  local k=$1 v=$2
+  if [[ $k == preset ]]; then
+    [[ $v =~ ^(beginner|normal|hard)$ ]] || { err "Unknown preset: $v"; return 1; }
+    gp_preset "$v"; return 0
+  fi
+  [[ $v =~ ^([0-9]+(\.[0-9]+)?|true|false)$ ]] || { err "Bad value for $k: $v"; return 1; }
+  case $k in
+    zombies)   gp_pop_set "$v" ;;
+    speed)     gp_set ZombieLore Speed "$v" ;;
+    strength)  gp_set ZombieLore Strength "$v"; gp_set ZombieLore Toughness "$v" ;;
+    infection) gp_set ZombieLore Transmission "$v" ;;
+    day)       gp_set "" DayLength "$v" ;;
+    xp)        gp_xp_set "$v" ;;
+    loot)      gp_loot_set "$v" ;;
+    utils)     gp_utils_set "$v" ;;
+    night)     gp_set "" NightDarkness "$v" ;;
+    injury)    gp_set "" InjurySeverity "$v" ;;
+    kit)       gp_set "" StarterKit "$v" ;;
+    points)    gp_set "" CharacterFreePoints "$v" ;;
+    *) err "Unknown option: $k"; return 1 ;;
+  esac
+  return 0
+}
+
+cmd_gameplay_get() {  # prints key=value (raw values) for the GUI
+  require_installed || return 1; sudo_start || return 1; gp_load || return 1
+  local xp; xp=$(gp_get MultiplierConfig Global) || xp=$(gp_get "" XpMultiplier)
+  echo "zombies=$(gp_get "" PopulationMultiplier)"
+  echo "speed=$(gp_get ZombieLore Speed)"
+  echo "strength=$(gp_get ZombieLore Strength)"
+  echo "infection=$(gp_get ZombieLore Transmission)"
+  echo "day=$(gp_get "" DayLength)"
+  echo "xp=${xp}"
+  echo "loot=$(gp_get "" "*LootNew")"
+  echo "utils=$(gp_get "" WaterShutModifier)"
+  echo "night=$(gp_get "" NightDarkness)"
+  echo "injury=$(gp_get "" InjurySeverity)"
+  echo "kit=$(gp_get "" StarterKit)"
+  echo "points=$(gp_get "" CharacterFreePoints)"
+  rm -f "$GP_TMP"; return 0
+}
+
+cmd_gameplay_set() {  # pzhost gameplay-set key=value… (restarts the server if it is running)
+  require_installed || return 1; ensure_permission || return 1; gp_load || return 1
+  local kv
+  for kv in "$@"; do
+    [[ $kv == *=* ]] || continue
+    gp_apply_kv "${kv%%=*}" "${kv#*=}" || { rm -f "$GP_TMP"; return 1; }
+  done
+  (( ${#GP_SKIPPED[@]} )) && warn "Not in this game version, skipped: ${GP_SKIPPED[*]}"
+  if [[ $GP_DIRTY == yes ]]; then gp_save || { rm -f "$GP_TMP"; return 1; }
+  else ok "Nothing changed."; fi
+  rm -f "$GP_TMP"; return 0
+}
+
+cmd_gameplay() {
+  require_installed || return 1; ensure_permission || return 1
+  local f; f=$(sandbox_file)
+  gp_load || return 1
   local c
   while :; do
     GP_SKIPPED=()
@@ -1539,21 +1833,26 @@ cmd_self_update() {
   run git -C "$src" pull --ff-only || { LAST_ERROR="Update app"; on_fail; return 1; }
   run bash "$src/install.sh" --no-launch || { LAST_ERROR="Update app"; on_fail; return 1; }
   ok "App updated to $(git -C "$src" log -1 --format='%h %s')"
+  [[ ${PZHOST_GUI:-} == 1 ]] && return 0   # the app restarts itself
   if [[ $INSTALLED == yes ]] && ask_yn "Re-apply server settings with the new version (Repair)?" y; then
     exec /usr/local/bin/pzhost setup
   fi
   exec /usr/local/bin/pzhost
 }
 
-cmd_uninstall() {
+cmd_uninstall() {  # flags: --yes, --delete-world (GUI)
+  local yes=no delworld=no a
+  for a in "$@"; do [[ $a == --yes ]] && yes=yes; [[ $a == --delete-world ]] && delworld=yes; done
   ensure_permission || return 1
   warn "This removes the services, power and firewall changes made by pzhost."
-  ask_yn "Continue?" n || return 0
+  [[ $yes == yes ]] || ask_yn "Continue?" n || return 0
   server_active && cmd_stop
   sudo systemctl disable --now pzserver.service pzbackup.timer pzrestart.timer 2>/dev/null
   sudo rm -f "${UNIT_DIR}"/pzserver.{service,socket} "${UNIT_DIR}"/pzbackup.{service,timer} "${UNIT_DIR}"/pzrestart.{service,timer}
   [[ -x $BATTERY_SCRIPT ]] && sudo "$BATTERY_SCRIPT" 100 >/dev/null 2>&1   # back to normal charging
   sudo systemctl disable pzbattery.service 2>/dev/null; sudo rm -f "$BATTERY_UNIT"
+  sudo systemctl disable --now pzwifi-watchdog.timer 2>/dev/null
+  sudo rm -f "${UNIT_DIR}"/pzwifi-watchdog.{service,timer} "$WIFI_MODPROBE"
   sudo rm -rf "${UNIT_DIR}/pzserver.service.d" "$LIB_DIR"
   sudo systemctl daemon-reload
   sudo rm -f "$SYSCTL_FILE" "$NM_WIFI_CONF"; sudo systemctl reload NetworkManager 2>/dev/null
@@ -1570,7 +1869,7 @@ cmd_uninstall() {
     sudo firewall-cmd --reload >/dev/null 2>&1
   fi
   ok "Services, power, network tuning and firewall changes removed."
-  if ask_yn "ALSO delete the server files AND THE WORLD in ${PZ_HOME}? (cannot be undone)" n; then
+  if [[ $delworld == yes ]] || { [[ $yes != yes ]] && ask_yn "ALSO delete the server files AND THE WORLD in ${PZ_HOME}? (cannot be undone)" n; }; then
     local copy="${HOME}/zomboid-world-backup-$(date +%F_%H%M).tar.gz"
     info "Saving a copy of the world to ${copy} first…"
     sudo tar czf "$copy" -C "$PZ_HOME" Zomboid backups 2>/dev/null; sudo chown "$(id -u):$(id -g)" "$copy"
@@ -1621,7 +1920,8 @@ cmd_report() {
   local desc f title
   echo; echo "${W}Error report${N} — passwords, emails and your public IP are removed automatically."
   echo "${D}Note: reports are PUBLIC GitHub issues — don't type private info in the description.${N}"
-  desc=$(ask "In a few words: what were you doing / what went wrong?" "")
+  if [[ -n ${PZHOST_REPORT_DESC:-} ]]; then desc=$PZHOST_REPORT_DESC
+  else desc=$(ask "In a few words: what were you doing / what went wrong?" ""); fi
   PUBLIC_IP_CACHE=$(public_ip)
   f="${STATE_DIR}/report-$(date +%F_%H%M%S).md"
   {
@@ -1803,18 +2103,29 @@ main() {
     say|msg)       cmd_say "$*" ;;
     save)          cmd_save ;;
     backup)        cmd_backup ;;
-    restore)       cmd_restore ;;
-    new-world|newworld|reset) cmd_newworld ;;
+    restore)       cmd_restore "$@" ;;
+    new-world|newworld|reset) cmd_newworld "$@" ;;
     logs|log)      cmd_logs ;;
     settings)      cmd_settings ;;
     gameplay|sandbox) cmd_gameplay ;;
     netcheck)      cmd_netcheck ;;
     ping|pingcheck) cmd_pingcheck ;;
     laptop|battery) cmd_laptop ;;
+    laptop-apply)  cmd_laptop_apply ;;
+    laptop-limit)  cmd_laptop_limit "${1:-}" ;;
+    gameplay-get)  cmd_gameplay_get ;;
+    gameplay-set)  cmd_gameplay_set "$@" ;;
+    backups)       cmd_backups_list ;;
+    set)           cmd_set "$@" ;;
+    gui-status)    cmd_gui_status ;;
+    gui-log)       cmd_gui_log "${1:-300}" ;;
+    permission-text) N='' W='' show_permission_screen ;;
+    update-check)  if update_available; then echo "update=yes"; else echo "update=no"; fi ;;
+    gui)           exec /usr/local/bin/pzhost-gui ;;
     update-server) cmd_update_server ;;
     report)        cmd_report ;;
     self-update|update) cmd_self_update ;;
-    uninstall)     cmd_uninstall ;;
+    uninstall)     cmd_uninstall "$@" ;;
     version|-v|--version) echo "pzhost ${PZHOST_VERSION}" ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;

@@ -1,0 +1,1145 @@
+#!/usr/bin/env python3
+"""Zomboid Host — window app for the pzhost server manager (Debian 13 / GTK4 + libadwaita).
+
+Every action runs the `pzhost` command underneath (PZHOST_GUI=1, no terminal):
+the app shows the questions as normal controls, and sudo gets the laptop
+password from the app's password dialog through SUDO_ASKPASS.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+
+try:
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
+except (ImportError, ValueError) as e:  # pragma: no cover
+    sys.stderr.write(
+        "Zomboid Host window needs GTK4 + libadwaita:\n"
+        "  sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1\n"
+        f"({e})\nThe terminal version still works: pzhost\n")
+    sys.exit(1)
+
+if (Adw.MAJOR_VERSION, Adw.MINOR_VERSION) < (1, 5):
+    sys.stderr.write("libadwaita 1.5 or newer is needed (Debian 13 has it). Use the terminal version: pzhost\n")
+    sys.exit(1)
+
+APP_ID = "io.github.rohansinghwow.ZomboidHost"
+PZHOST = shutil.which("pzhost") or "/usr/local/bin/pzhost"
+ASKPASS = shutil.which("pzhost-askpass") or "/usr/local/bin/pzhost-askpass"
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+PW_RE = re.compile(r"^[A-Za-z0-9_-]{4,32}$")
+URL_TAILSCALE = re.compile(r"https://login\.tailscale\.com/\S+")
+URL_GH = re.compile(r"https://github\.com/login/device\S*")
+GH_CODE = re.compile(r"code:\s*([A-Z0-9]{4}-[A-Z0-9]{4})")
+URL_ISSUE = re.compile(r"https://github\.com/\S+/issues/\d+")
+
+# ---- gameplay options: (key, title, subtitle, [(label, value), ...]) ----------------------
+REC = "  ★ recommended for beginners"
+GAMEPLAY = [
+    ("zombies", "How many zombies", "Lower = safer. Existing zombies thin out slowly; a new world starts with the new amount.",
+     [("None (just explore / build)", "0"), ("Very few", "0.15"), ("Few" + REC, "0.35"), ("Normal", "0.65"),
+      ("Many", "1.2"), ("Very many", "1.6"), ("Insane", "2.5")]),
+    ("speed", "Zombie speed", None,
+     [("Sprinters (very hard)", "1"), ("Fast shamblers (normal)", "2"), ("Shamblers / slow" + REC, "3"), ("Random mix", "4")]),
+    ("strength", "Zombie strength & toughness", None,
+     [("Superhuman (hard)", "1"), ("Normal", "2"), ("Weak" + REC, "3")]),
+    ("infection", "Infection", "What happens when a zombie hurts you",
+     [("Bites + scratches can infect (normal)", "1"), ("Only bites infect" + REC, "2"),
+      ("Everyone is already infected", "3"), ("Never infected (easiest)", "4")]),
+    ("day", "Length of one in-game day", "Real time",
+     [("15 minutes", "1"), ("30 minutes", "2"), ("1 hour (normal)", "3"), ("1.5 hours" + REC, "4"),
+      ("2 hours", "5"), ("3 hours", "6"), ("4 hours", "7")]),
+    ("xp", "Skill learning speed (XP)", None,
+     [("1x (normal)", "1.0"), ("2x" + REC, "2.0"), ("3x", "3.0"), ("5x", "5.0")]),
+    ("loot", "Amount of loot", "Only fills containers nobody has opened yet",
+     [("Rare (hard)", "0.3"), ("Normal", "0.6"), ("Plenty" + REC, "1.0"), ("Lots", "2.0")]),
+    ("utils", "Water & electricity stay on for", "Can't come back once they've shut off in your world",
+     [("1 week (hard)", "7"), ("2 weeks (normal)", "14"), ("1 month", "30"), ("3 months" + REC, "90"), ("1 year", "365")]),
+    ("night", "Night darkness", None,
+     [("Pitch black", "1"), ("Dark", "2"), ("Normal  ★ recommended", "3"), ("Bright", "4")]),
+    ("injury", "Injury severity", None,
+     [("Low" + REC, "1"), ("Normal", "2"), ("High", "3")]),
+    ("kit", "Starter bag on spawn", "A bag with basic supplies for new characters",
+     [("Yes" + REC, "true"), ("No", "false")]),
+    ("points", "Extra trait points for new characters", None,
+     [("0 (normal)", "0"), ("+4" + REC, "4"), ("+8", "8")]),
+]
+PRESETS = [
+    ("beginner", "Beginner", "Few slow, weak zombies · only bites infect · 2x XP · more loot · longer days · "
+                             "water/power ~3 months · starter bag · +4 trait points"),
+    ("normal", "Normal", "The game's standard “Apocalypse” settings"),
+    ("hard", "Hard", "More zombies · less loot · darker nights · water/power off after a week"),
+]
+MEMORY = ["3g", "4g", "6g", "8g", "10g"]
+AUTOSAVE = [5, 10, 15, 30]
+BATTERY = [("60%  (best for battery life)", 60), ("70%", 70), ("80%  ★ recommended", 80), ("90%", 90), ("No limit (100%)", 100)]
+
+
+def parse_kv(text):
+    d = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k.strip()] = v.strip()
+    return d
+
+
+def closest(options, raw):
+    """Index of the option whose value is closest to raw (numbers) or equal (text)."""
+    if raw is None or raw == "":
+        return None
+    try:
+        r = float(raw)
+        return min(range(len(options)), key=lambda i: abs(float(options[i][1]) - r))
+    except ValueError:
+        for i, (_, v) in enumerate(options):
+            if v == raw:
+                return i
+    return None
+
+
+def row_button(label, cb, style=None, icon=None):
+    b = Gtk.Button(valign=Gtk.Align.CENTER)
+    if icon and not label:
+        b.set_icon_name(icon)
+    else:
+        b.set_label(label)
+    if style:
+        b.add_css_class(style)
+    b.connect("clicked", lambda *_: cb())
+    return b
+
+
+def string_combo(title, labels, subtitle=None):
+    row = Adw.ComboRow(title=title, model=Gtk.StringList.new(labels))
+    if subtitle:
+        row.set_subtitle(subtitle)
+    return row
+
+
+# =============================================================================
+#  Task dialog: runs one pzhost command and shows its output live
+# =============================================================================
+class TaskDialog(Adw.Dialog):
+    def __init__(self, app, title, args, extra_env=None, on_done=None):
+        super().__init__(title=title, content_width=720, content_height=520)
+        self.app, self.args, self.on_done = app, args, on_done
+        self.extra_env = extra_env or {}
+        self.opened_urls = set()
+        self.proc = None
+
+        tv = Adw.ToolbarView()
+        hb = Adw.HeaderBar()
+        tv.add_top_bar(hb)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                      margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        top = Gtk.Box(spacing=10)
+        self.spinner = Adw.Spinner() if hasattr(Adw, "Spinner") else Gtk.Spinner(spinning=True)
+        self.status = Gtk.Label(label="Working… please wait", xalign=0, hexpand=True, wrap=True)
+        self.status.add_css_class("title-4")
+        top.append(self.spinner)
+        top.append(self.status)
+        box.append(top)
+
+        self.buf = Gtk.TextBuffer()
+        self.view = Gtk.TextView(buffer=self.buf, editable=False, cursor_visible=False, monospace=True,
+                                 wrap_mode=Gtk.WrapMode.WORD_CHAR, top_margin=8, bottom_margin=8,
+                                 left_margin=8, right_margin=8)
+        sw = Gtk.ScrolledWindow(vexpand=True, child=self.view)
+        sw.add_css_class("card")
+        box.append(sw)
+
+        self.links = Gtk.Box(spacing=8)
+        box.append(self.links)
+
+        btns = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        self.report_btn = Gtk.Button(label="Send error report", visible=False)
+        self.report_btn.add_css_class("destructive-action")
+        self.report_btn.connect("clicked", lambda *_: (self.close(), self.app.send_report()))
+        self.close_btn = Gtk.Button(label="Close", sensitive=False)
+        self.close_btn.add_css_class("suggested-action")
+        self.close_btn.connect("clicked", lambda *_: self.close())
+        btns.append(self.report_btn)
+        btns.append(self.close_btn)
+        box.append(btns)
+
+        tv.set_content(box)
+        self.set_child(tv)
+        self.set_can_close(False)
+
+    def start(self, parent):
+        self.present(parent)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            self.proc = subprocess.Popen([PZHOST, *self.args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, env=self.app.env(self.extra_env),
+                                         text=True, bufsize=1, errors="replace")
+            for line in self.proc.stdout:
+                GLib.idle_add(self._append, ANSI.sub("", line))
+            rc = self.proc.wait()
+        except OSError as e:
+            GLib.idle_add(self._append, f"Could not run pzhost: {e}\n")
+            rc = 127
+        GLib.idle_add(self._finish, rc)
+
+    def _append(self, line):
+        end = self.buf.get_end_iter()
+        self.buf.insert(end, line)
+        self.view.scroll_to_mark(self.buf.create_mark(None, self.buf.get_end_iter(), False), 0, False, 0, 1)
+        for rx, label in ((URL_TAILSCALE, "Open Tailscale login"), (URL_GH, "Open GitHub login"),
+                          (URL_ISSUE, "Open the report")):
+            m = rx.search(line)
+            if m and m.group(0) not in self.opened_urls:
+                url = m.group(0).rstrip(".,)")
+                self.opened_urls.add(m.group(0))
+                b = Gtk.Button(label=label)
+                b.add_css_class("pill")
+                b.connect("clicked", lambda *_, u=url: self.app.open_url(u))
+                self.links.append(b)
+                if rx is URL_TAILSCALE:
+                    self.status.set_label("Log in to Tailscale in your browser (it opened by itself) — then wait here")
+                    self.app.open_url(url)
+        m = GH_CODE.search(line)
+        if m:
+            code = m.group(1)
+            self.app.copy(code)
+            self.status.set_label(f"GitHub code {code} copied — paste it in the browser page")
+        return False
+
+    def _finish(self, rc):
+        self.spinner.set_visible(False)
+        self.close_btn.set_sensitive(True)
+        self.set_can_close(True)
+        if rc == 0:
+            self.status.set_label("✔ Done")
+        else:
+            self.status.set_label("✘ Something went wrong — see the messages above")
+            if self.args[:1] != ["report"]:
+                self.report_btn.set_visible(True)
+        if self.on_done:
+            self.on_done(rc, self.buf.get_text(self.buf.get_start_iter(), self.buf.get_end_iter(), False))
+        self.app.refresh_status()
+        return False
+
+
+# =============================================================================
+#  Main window
+# =============================================================================
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Zomboid Host", default_width=900, default_height=760)
+        self.app = app
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+
+        self.root = Adw.ToolbarView()
+        self.toasts.set_child(self.root)
+        self.header = Adw.HeaderBar()
+        self.root.add_top_bar(self.header)
+        self.banner = Adw.Banner(title="An app update is available", button_label="Update now")
+        self.banner.connect("button-clicked", lambda *_: app.update_app())
+        self.root.add_top_bar(self.banner)
+
+        self.stack = Adw.ViewStack()
+        self.switcher = Adw.ViewSwitcher(stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE)
+        self.header.set_title_widget(self.switcher)
+        self.bottom = Adw.ViewSwitcherBar(stack=self.stack)
+        self.root.add_bottom_bar(self.bottom)
+        self.root.set_content(self.stack)
+
+        # narrow window → switcher at the bottom
+        bp = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 640sp"))
+        bp.add_setter(self.bottom, "reveal", True)
+        bp.add_setter(self.header, "title-widget", Gtk.Label(label="Zomboid Host"))
+        self.add_breakpoint(bp)
+
+        self.setup_page = SetupPage(app)
+        self.home = HomePage(app)
+        self.gameplay = GameplayPage(app)
+        self.world = WorldPage(app)
+        self.laptop = LaptopPage(app)
+        self.more = MorePage(app)
+        self.stack.add_titled_with_icon(self.setup_page, "setup", "Set up", "emblem-system-symbolic")
+        self.stack.add_titled_with_icon(self.home, "home", "Server", "network-server-symbolic")
+        self.stack.add_titled_with_icon(self.gameplay, "gameplay", "Gameplay", "applications-games-symbolic")
+        self.stack.add_titled_with_icon(self.world, "world", "World", "folder-saved-search-symbolic")
+        self.stack.add_titled_with_icon(self.laptop, "laptop", "Laptop", "computer-symbolic")
+        self.stack.add_titled_with_icon(self.more, "more", "More", "preferences-system-symbolic")
+        self.stack.connect("notify::visible-child", self._page_changed)
+
+    def _page_changed(self, *_):
+        page = self.stack.get_visible_child()
+        if hasattr(page, "on_shown"):
+            page.on_shown()
+
+    def set_installed(self, installed):
+        for name in ("home", "gameplay", "world", "laptop"):
+            self.stack.get_page(self.stack.get_child_by_name(name)).set_visible(installed)
+        self.stack.get_page(self.setup_page).set_visible(not installed)
+        cur = self.stack.get_visible_child_name()
+        if installed and cur == "setup":
+            self.stack.set_visible_child_name("home")
+        elif not installed and cur in ("home", "gameplay", "world", "laptop"):
+            self.stack.set_visible_child_name("setup")
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
+
+
+def page_scaffold():
+    page = Adw.PreferencesPage()
+    return page
+
+
+# ---------------------------------------------------------------- Setup (first time)
+class SetupPage(Adw.Bin):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        page = Adw.PreferencesPage()
+        self.set_child(page)
+
+        intro = Adw.PreferencesGroup(
+            title="Set up your Project Zomboid server",
+            description="Fill this in once. The app downloads the server (~5 GB), creates the world and "
+                        "sets the laptop up as a server. It takes 10–30 minutes.")
+        page.add(intro)
+
+        g = Adw.PreferencesGroup(title="Game")
+        self.version = Adw.EntryRow(title="Game version (must match all friends' game)", text="42.21")
+        self.playing = Adw.SwitchRow(title="I will also play the game on this laptop",
+                                     subtitle="Leaves more memory for the game", active=True)
+        g.add(self.version)
+        g.add(self.playing)
+        page.add(g)
+
+        p = Adw.PreferencesGroup(title="Passwords",
+                                 description="4–32 characters: letters, numbers, - or _")
+        self.join_pw = Adw.PasswordEntryRow(title="Join password (friends type this to join)")
+        self.admin_pw = Adw.PasswordEntryRow(title="Admin password (only for you — different from join password)")
+        p.add(self.join_pw)
+        p.add(self.admin_pw)
+        page.add(p)
+
+        n = Adw.PreferencesGroup(title="Connection")
+        self.net = string_combo("How friends connect", ["Tailscale  ★ recommended (works with Jio)",
+                                                        "Router port forwarding"])
+        self.autostart = Adw.SwitchRow(title="Start the server when the laptop turns on", active=True)
+        n.add(self.net)
+        n.add(self.autostart)
+        page.add(n)
+
+        b = Adw.PreferencesGroup()
+        go = Gtk.Button(label="Set up the server", halign=Gtk.Align.CENTER, margin_top=6)
+        go.add_css_class("suggested-action")
+        go.add_css_class("pill")
+        go.connect("clicked", lambda *_: self.start())
+        b.add(go)
+        page.add(b)
+
+    def start(self):
+        jp, ap = self.join_pw.get_text(), self.admin_pw.get_text()
+        if not PW_RE.match(jp) or not PW_RE.match(ap):
+            self.app.win.toast("Passwords: 4–32 letters, numbers, - or _")
+            return
+        if jp == ap:
+            self.app.win.toast("Use a different admin password")
+            return
+        ram = int(self.app.status.get("ram_gb") or 16)
+        if self.playing.get_active():
+            xmx = "6g" if ram >= 15 else "3g"
+        else:
+            xmx = "8g" if ram >= 15 else "4g"
+        env = {"GUI_BRANCH": self.version.get_text().strip() or "42.21", "GUI_XMX": xmx,
+               "GUI_JOIN_PASSWORD": jp, "GUI_ADMIN_PASSWORD": ap,
+               "GUI_NETWORK": "portforward" if self.net.get_selected() == 1 else "tailscale",
+               "GUI_AUTOSTART": "yes" if self.autostart.get_active() else "no"}
+        self.app.with_permission(lambda: self.app.run_task("Setting up the server", ["setup"], env))
+
+
+# ---------------------------------------------------------------- Server (home)
+class HomePage(Adw.Bin):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        page = Adw.PreferencesPage()
+        self.set_child(page)
+
+        g = Adw.PreferencesGroup(title="Server")
+        self.state_row = Adw.ActionRow(title="Checking…")
+        self.state_icon = Gtk.Image(icon_name="media-record-symbolic", pixel_size=22)
+        self.state_row.add_prefix(self.state_icon)
+        self.btn_start = row_button("Start", lambda: app.run_task("Starting server", ["start"]), "suggested-action")
+        self.btn_stop = row_button("Stop", lambda: app.confirm(
+            "Stop the server?", "The world is saved first. Friends in the game get disconnected.",
+            "Stop", lambda: app.run_task("Stopping server", ["stop"]), destructive=True))
+        self.btn_restart = row_button("Restart", lambda: app.run_task("Restarting server", ["restart"]))
+        for b in (self.btn_restart, self.btn_stop, self.btn_start):
+            self.state_row.add_suffix(b)
+        g.add(self.state_row)
+        page.add(g)
+
+        j = Adw.PreferencesGroup(title="Join info for friends",
+                                 description="In the game: Join → add server → type these in")
+        self.addr = self._copy_row(j, "Server address (IP)")
+        self.port = self._copy_row(j, "Port")
+        self.pw = self._copy_row(j, "Server password", secret=True)
+        self.ver = Adw.ActionRow(title="Game version")
+        j.add(self.ver)
+        self.net_row = Adw.ActionRow(title="Connection")
+        j.add(self.net_row)
+        copy_all = Gtk.Button(label="Copy everything for a chat message", halign=Gtk.Align.CENTER, margin_top=8)
+        copy_all.add_css_class("pill")
+        copy_all.connect("clicked", lambda *_: self.copy_card())
+        j.add(copy_all)
+        page.add(j)
+
+        pl = Adw.PreferencesGroup(title="Players online")
+        self.players = Adw.ActionRow(title="Press refresh to see who is online", subtitle_lines=6)
+        self.players.add_suffix(row_button("", self.refresh_players, "flat", icon="view-refresh-symbolic"))
+        pl.add(self.players)
+        self.msg = Adw.EntryRow(title="Message to all players", show_apply_button=True)
+        self.msg.connect("apply", lambda *_: self.say())
+        pl.add(self.msg)
+        page.add(pl)
+
+    def _copy_row(self, group, title, secret=False):
+        row = Adw.ActionRow(title=title, subtitle="…")
+        row.add_css_class("property")
+        row.secret = secret
+        row.value = ""
+        if secret:
+            eye = Gtk.ToggleButton(icon_name="view-reveal-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Show")
+            eye.add_css_class("flat")
+            eye.connect("toggled", lambda b: row.set_subtitle(row.value if b.get_active() else "••••••••"))
+            row.add_suffix(eye)
+            row.eye = eye
+        cp = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Copy")
+        cp.add_css_class("flat")
+        cp.connect("clicked", lambda *_: (self.app.copy(row.value), self.app.win.toast(f"{title} copied")))
+        row.add_suffix(cp)
+        group.add(row)
+        return row
+
+    def _set(self, row, value):
+        row.value = value
+        if row.secret and not row.eye.get_active():
+            row.set_subtitle("••••••••" if value else "-")
+        else:
+            row.set_subtitle(value or "-")
+
+    def update(self, s):
+        running = s.get("running") == "yes"
+        self.state_row.set_title("Running" if running else "Stopped")
+        self.state_row.set_subtitle(("since " + s.get("since", "")) if running and s.get("since") else
+                                    "Friends can't join until you press Start" if not running else "")
+        for c in ("success", "error"):
+            self.state_icon.remove_css_class(c)
+        self.state_icon.add_css_class("success" if running else "error")
+        self.btn_start.set_visible(not running)
+        self.btn_stop.set_visible(running)
+        self.btn_restart.set_visible(running)
+        ip = s.get("ip") or ("Tailscale not connected — More → Repair" if s.get("network") == "tailscale"
+                             else "could not detect")
+        self._set(self.addr, ip)
+        self._set(self.port, s.get("port", "16261"))
+        self._set(self.pw, s.get("join_password", ""))
+        self.ver.set_subtitle(s.get("branch", "") + " — friends must use exactly this version")
+        if s.get("network") == "tailscale":
+            self.net_row.set_subtitle("Tailscale — friends install Tailscale, accept your invite and stay connected")
+        else:
+            self.net_row.set_subtitle("Port forwarding — the IP can change after a router restart")
+
+    def copy_card(self):
+        def done(rc, out):
+            lines = ANSI.sub("", out).splitlines()
+            start = next((i for i, l in enumerate(lines) if "JOIN INFO" in l), 0)
+            end = max((i for i, l in enumerate(lines) if l.startswith("====")), default=len(lines) - 1)
+            self.app.copy("\n".join(lines[start:end + 1]).strip())
+            self.app.win.toast("Join info copied — paste it in your group chat")
+        self.app.query(["join"], done)
+
+    def refresh_players(self):
+        if self.app.status.get("running") != "yes":
+            self.players.set_title("Server is stopped")
+            self.players.set_subtitle("")
+            return
+        self.players.set_title("Asking the server…")
+
+        def done(rc, out):
+            lines = [l.strip() for l in ANSI.sub("", out).splitlines()
+                     if l.strip() and "password" not in l.lower() and "Players online" not in l]
+            names = [l.lstrip("-").strip() for l in lines if l.startswith("-")]
+            if names:
+                self.players.set_title(f"{len(names)} online")
+                self.players.set_subtitle(", ".join(names))
+            else:
+                self.players.set_title("Nobody online right now" if rc == 0 else "Could not ask the server")
+                self.players.set_subtitle("\n".join(lines[-3:]) if rc != 0 else "")
+        self.app.with_sudo(lambda: self.app.query(["players"], done))
+
+    def say(self):
+        text = self.msg.get_text().strip()
+        if not text:
+            return
+        self.msg.set_text("")
+        self.app.with_sudo(lambda: self.app.query(
+            ["say", text], lambda rc, out: self.app.win.toast("Message sent" if rc == 0 else "Could not send")))
+
+    def on_shown(self):
+        pass
+
+
+# ---------------------------------------------------------------- Gameplay
+class GameplayPage(Adw.Bin):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.loaded = False
+        page = Adw.PreferencesPage()
+        self.set_child(page)
+
+        pg = Adw.PreferencesGroup(title="Quick presets",
+                                  description="New to Project Zomboid? Start with Beginner. You can change single options below after.")
+        for key, title, desc in PRESETS:
+            r = Adw.ActionRow(title=title, subtitle=desc, subtitle_lines=3)
+            b = row_button("Use", lambda k=key, t=title: self.preset(k, t),
+                           "suggested-action" if key == "beginner" else None)
+            r.add_suffix(b)
+            r.set_activatable_widget(b)
+            pg.add(r)
+        page.add(pg)
+
+        og = Adw.PreferencesGroup(title="Change one thing")
+        self.status_lbl = Gtk.Label(label="", css_classes=["dim-label"])
+        og.set_header_suffix(self.status_lbl)
+        self.rows = {}
+        for key, title, sub, opts in GAMEPLAY:
+            r = string_combo(title, [o[0] for o in opts], sub)
+            r.set_sensitive(False)
+            self.rows[key] = r
+            og.add(r)
+        page.add(og)
+
+        sg = Adw.PreferencesGroup()
+        save = Gtk.Button(label="Save and apply", halign=Gtk.Align.CENTER)
+        save.add_css_class("suggested-action")
+        save.add_css_class("pill")
+        save.connect("clicked", lambda *_: self.save())
+        sg.add(save)
+        page.add(sg)
+
+    def on_shown(self):
+        if not self.loaded:
+            self.load()
+
+    def load(self):
+        self.status_lbl.set_label("Loading…")
+
+        def done(rc, out):
+            if rc != 0:
+                self.status_lbl.set_label("Could not read settings")
+                self.app.win.toast(ANSI.sub("", out).strip().splitlines()[-1] if out.strip() else "Could not read settings")
+                return
+            vals = parse_kv(out)
+            self.current = {}
+            for key, _, _, opts in GAMEPLAY:
+                row = self.rows[key]
+                i = closest(opts, vals.get(key))
+                if i is None:
+                    row.set_sensitive(False)
+                    row.set_subtitle("Not available in this game version")
+                    continue
+                row.set_sensitive(True)
+                row.set_selected(i)
+                self.current[key] = i
+            self.loaded = True
+            self.status_lbl.set_label("")
+        self.app.with_sudo(lambda: self.app.query(["gameplay-get"], done))
+
+    def _restart_note(self):
+        return ("The server restarts to use the new settings (friends are kicked for about a minute)."
+                if self.app.status.get("running") == "yes" else "They are used the next time the server starts.")
+
+    def preset(self, key, title):
+        self.app.confirm(f"Use the {title} settings?", self._restart_note(), "Apply",
+                         lambda: self.app.run_task(f"Applying {title} settings", ["gameplay-set", f"preset={key}"],
+                                                   on_done=lambda rc, out: self.load()))
+
+    def save(self):
+        if not self.loaded:
+            return self.load()
+        changes = []
+        for key, _, _, opts in GAMEPLAY:
+            row = self.rows[key]
+            if key in self.current and self.current[key] != row.get_selected():
+                changes.append(f"{key}={opts[row.get_selected()][1]}")
+        if not changes:
+            self.app.win.toast("Nothing changed")
+            return
+        self.app.confirm("Save gameplay settings?", self._restart_note(), "Save",
+                         lambda: self.app.run_task("Saving gameplay settings", ["gameplay-set", *changes],
+                                                   on_done=lambda rc, out: self.load()))
+
+
+# ---------------------------------------------------------------- World
+class WorldPage(Adw.Bin):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        page = Adw.PreferencesPage()
+        self.set_child(page)
+
+        g = Adw.PreferencesGroup(title="Save")
+        r = Adw.ActionRow(title="Save the world now", subtitle="The server also saves by itself every few minutes")
+        r.add_suffix(row_button("Save now", lambda: app.with_sudo(lambda: app.query(
+            ["save"], lambda rc, out: app.win.toast("World saved" if rc == 0 else "Server is not running")))))
+        g.add(r)
+        r = Adw.ActionRow(title="Make a backup now", subtitle="Automatic backups run every day at 05:00 (kept 7 days)")
+        r.add_suffix(row_button("Back up", lambda: app.run_task("Backing up the world", ["backup"],
+                                                                on_done=lambda *_: self.load())))
+        g.add(r)
+        page.add(g)
+
+        self.bg = Adw.PreferencesGroup(title="Backups",
+                                       description="Go back in time: restoring replaces the current world "
+                                                   "(the current world is backed up first)")
+        self.bg.set_header_suffix(row_button("", self.load, "flat", icon="view-refresh-symbolic"))
+        self.backup_rows = []
+        page.add(self.bg)
+
+        d = Adw.PreferencesGroup(title="Start over")
+        r = Adw.ActionRow(title="Start a new world",
+                          subtitle="New map, everyone makes a new character. Usernames, passwords and settings "
+                                   "are kept. The old world is moved aside, not deleted.", subtitle_lines=3)
+        r.add_suffix(row_button("New world…", self.new_world, "destructive-action"))
+        d.add(r)
+        page.add(d)
+
+    def on_shown(self):
+        self.load()
+
+    def load(self):
+        def done(rc, out):
+            for r in self.backup_rows:
+                self.bg.remove(r)
+            self.backup_rows = []
+            items = [l.split("|") for l in out.splitlines() if l.count("|") == 2]
+            if not items:
+                r = Adw.ActionRow(title="No backups yet")
+                self.bg.add(r)
+                self.backup_rows.append(r)
+            for name, size, date in items[:20]:
+                r = Adw.ActionRow(title=date, subtitle=f"{name} · {size}")
+                r.add_suffix(row_button("Restore", lambda n=name, d=date: self.restore(n, d)))
+                self.bg.add(r)
+                self.backup_rows.append(r)
+        self.app.with_sudo(lambda: self.app.query(["backups"], done))
+
+    def restore(self, name, date):
+        self.app.confirm("Restore this backup?",
+                         f"The world goes back to {date}. Everything after that is lost "
+                         "(the current world is backed up first). The server restarts.",
+                         "Restore", lambda: self.app.run_task("Restoring backup", ["restore", name, "--yes"],
+                                                              on_done=lambda *_: self.load()), destructive=True)
+
+    def new_world(self):
+        dlg = Adw.AlertDialog(heading="Start a new world?",
+                              body="Everything in the game starts over: new map, new characters. "
+                                   "A backup is made first and the old world is kept on the laptop.")
+        combo = Gtk.DropDown.new_from_strings(["Beginner settings  ★ recommended", "Normal settings",
+                                               "Hard settings", "Keep my current gameplay settings"])
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.append(Gtk.Label(label="Gameplay settings for the new world:", xalign=0))
+        box.append(combo)
+        dlg.set_extra_child(box)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("go", "Start new world")
+        dlg.set_response_appearance("go", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r != "go":
+                return
+            args = ["new-world", "--yes"]
+            i = combo.get_selected()
+            if i < 3:
+                args += ["--preset", ["beginner", "normal", "hard"][i]]
+            self.app.run_task("Starting a new world", args)
+        dlg.connect("response", resp)
+        dlg.present(self.app.win)
+
+
+# ---------------------------------------------------------------- Laptop
+class LaptopPage(Adw.Bin):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self._busy = False
+        page = Adw.PreferencesPage()
+        self.set_child(page)
+
+        top = Adw.PreferencesGroup(
+            title="Laptop as a server",
+            description="Keep it plugged in and on Wi-Fi, and let it run. One click sets everything below.")
+        r = Adw.ActionRow(title="Make this laptop a server",
+                          subtitle="Battery limit · no sleep · Wi-Fi never sleeps and reconnects by itself · "
+                                   "server starts on boot", subtitle_lines=2)
+        r.add_suffix(row_button("Set up", lambda: app.with_permission(
+            lambda: app.run_task("Making this laptop a server", ["laptop-apply"])), "suggested-action"))
+        top.add(r)
+        page.add(top)
+
+        g = Adw.PreferencesGroup(title="Status")
+        self.r_charger = self._row(g, "Charger")
+        self.r_limit = self._row(g, "Battery charge limit")
+        self.r_sleep = self._row(g, "Sleep / hibernate / lid-close")
+        self.r_wifi = self._row(g, "Wi-Fi")
+        self.r_wd = self._row(g, "Wi-Fi watchdog")
+        self.r_boot = self._row(g, "Server starts on boot")
+        page.add(g)
+
+        b = Adw.PreferencesGroup(title="Battery")
+        self.limit = string_combo("Stop charging at", [x[0] for x in BATTERY],
+                                  "A battery kept at 100% all day wears out fast")
+        self.limit.connect("notify::selected", lambda *_: self.limit_changed())
+        b.add(self.limit)
+        page.add(b)
+
+        t = Adw.PreferencesGroup(title="Tip")
+        t.add(Adw.ActionRow(title="Turn the laptop back on after a power cut",
+                            subtitle="In the BIOS (F2 / F10 / Del at power-on) set “AC power recovery” or "
+                                     "“Power on AC attach” to ON, if your laptop has it.", subtitle_lines=3))
+        page.add(t)
+
+    def _row(self, g, title):
+        r = Adw.ActionRow(title=title, subtitle="…")
+        r.icon = Gtk.Image(icon_name="emblem-ok-symbolic")
+        r.add_prefix(r.icon)
+        g.add(r)
+        return r
+
+    @staticmethod
+    def _mark(row, good, text):
+        row.set_subtitle(text)
+        row.icon.set_from_icon_name("emblem-ok-symbolic" if good else "dialog-warning-symbolic")
+        for c in ("success", "warning"):
+            row.icon.remove_css_class(c)
+        row.icon.add_css_class("success" if good else "warning")
+
+    def update(self, s):
+        if s.get("battery"):
+            ac = s.get("ac") == "yes"
+            self._mark(self.r_charger, ac, f"{'Plugged in' if ac else 'NOT plugged in'} · battery {s['battery']}%")
+            lim = s.get("limit_now", "")
+            if lim == "unsupported":
+                self._mark(self.r_limit, False, "This laptop only allows it in the BIOS (look for "
+                                                "“Battery Health” / “Charge limit”)")
+            elif lim in ("100", ""):
+                self._mark(self.r_limit, False, "Off — charges to 100%")
+            elif lim == "conservation":
+                self._mark(self.r_limit, True, "On (Lenovo conservation mode)")
+            else:
+                self._mark(self.r_limit, True, f"Stops charging at {lim}%")
+        else:
+            self._mark(self.r_charger, True, "No battery (desktop PC)")
+            self._mark(self.r_limit, True, "Not needed")
+        self._mark(self.r_sleep, s.get("nosleep") == "yes",
+                   "Blocked — the laptop never sleeps" if s.get("nosleep") == "yes" else "Laptop can still go to sleep")
+        w = s.get("wifi", "")
+        if w == "cable":
+            self._mark(self.r_wifi, True, "Using a cable — best for ping")
+        elif w == "offline":
+            self._mark(self.r_wifi, False, "No internet connection!")
+        else:
+            ok = s.get("wifi_boot") == "yes" and s.get("wifi_powersave") == "off"
+            sig = f" · signal {s['wifi_signal']}%" if s.get("wifi_signal") else ""
+            self._mark(self.r_wifi, ok, f"{w}{sig} — " + ("connects at boot, never sleeps" if ok
+                                                           else "press Set up to keep it always on"))
+        self._mark(self.r_wd, s.get("watchdog") == "yes",
+                   "On — reconnects Wi-Fi if the internet drops" if s.get("watchdog") == "yes" else "Off")
+        self._mark(self.r_boot, s.get("autostart") == "yes",
+                   "Yes" if s.get("autostart") == "yes" else "No — after a reboot someone must press Start")
+        self._busy = True
+        try:
+            want = int(s.get("limit_setting") or 80)
+            self.limit.set_selected(min(range(len(BATTERY)), key=lambda i: abs(BATTERY[i][1] - want)))
+        except ValueError:
+            pass
+        self._busy = False
+
+    def limit_changed(self):
+        if self._busy:
+            return
+        pct = BATTERY[self.limit.get_selected()][1]
+        if str(pct) == self.app.status.get("limit_setting"):
+            return
+        self.app.with_permission(lambda: self.app.run_task(f"Battery limit {pct}%", ["laptop-limit", str(pct)]))
+
+    def on_shown(self):
+        self.app.refresh_status()
+
+
+# ---------------------------------------------------------------- More (settings + help)
+class MorePage(Adw.Bin):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self._busy = False
+        page = Adw.PreferencesPage()
+        self.set_child(page)
+
+        self.sg = Adw.PreferencesGroup(title="Server settings")
+        self.join_pw = Adw.PasswordEntryRow(title="New join password for friends", show_apply_button=True)
+        self.join_pw.connect("apply", lambda *_: self.set_join_pw())
+        self.sg.add(self.join_pw)
+        self.mem = string_combo("Server memory", MEMORY, "More = smoother with many zombies. Leave 6 GB for the game "
+                                                         "if you also play on this laptop.")
+        self.mem.connect("notify::selected", lambda *_: self._changed(
+            "memory", MEMORY[self.mem.get_selected()], "Server memory"))
+        self.sg.add(self.mem)
+        self.save_min = string_combo("Auto-save the world every", [f"{m} minutes" for m in AUTOSAVE])
+        self.save_min.connect("notify::selected", lambda *_: self._changed(
+            "autosave", str(AUTOSAVE[self.save_min.get_selected()]), "Auto-save"))
+        self.sg.add(self.save_min)
+        self.boot = Adw.SwitchRow(title="Start the server when the laptop turns on")
+        self.boot.connect("notify::active", lambda *_: self._changed(
+            "autostart", "yes" if self.boot.get_active() else "no", "Start on boot"))
+        self.sg.add(self.boot)
+        self.version = Adw.EntryRow(title="Game version (all friends must match)", show_apply_button=True)
+        self.version.connect("apply", lambda *_: self.set_version())
+        self.sg.add(self.version)
+        self.net = string_combo("How friends connect", ["Tailscale", "Router port forwarding"])
+        self.net.connect("notify::selected", lambda *_: self._changed(
+            "network", "portforward" if self.net.get_selected() == 1 else "tailscale", "Connection"))
+        self.sg.add(self.net)
+        page.add(self.sg)
+
+        h = Adw.PreferencesGroup(title="Check and fix")
+        self._action(h, "Ping check", "Ping, Wi-Fi quality, Tailscale direct vs relay", "Check",
+                     lambda: app.run_task("Ping check", ["ping"]))
+        self._action(h, "Network check", "Does Jio allow port forwarding?", "Check",
+                     lambda: app.run_task("Network check", ["netcheck"]))
+        self._action(h, "Server log", "The last messages from the game server", "Show", self.show_log)
+        self._action(h, "Repair", "Runs the setup again (keeps your world and settings)", "Repair",
+                     lambda: app.with_permission(lambda: app.run_task("Repairing", ["setup"])))
+        self._action(h, "Send error report", "Sends the logs (passwords removed) so the problem can be fixed",
+                     "Send…", app.send_report)
+        self._action(h, "Update this app", "Gets the newest version from GitHub", "Update", app.update_app)
+        page.add(h)
+
+        d = Adw.PreferencesGroup(title="Danger zone")
+        self._action(d, "Uninstall", "Removes services, power and network changes. The world is kept.",
+                     "Uninstall…", self.uninstall, "destructive-action")
+        page.add(d)
+
+        self.about = Adw.PreferencesGroup()
+        self.about_row = Adw.ActionRow(title="Zomboid Host", subtitle="")
+        self.about.add(self.about_row)
+        page.add(self.about)
+
+    def _action(self, group, title, sub, label, cb, style=None):
+        r = Adw.ActionRow(title=title, subtitle=sub)
+        r.add_suffix(row_button(label, cb, style))
+        group.add(r)
+
+    def update(self, s):
+        self._busy = True
+        self.sg.set_sensitive(s.get("installed") == "yes")
+        if s.get("memory") in MEMORY:
+            self.mem.set_selected(MEMORY.index(s["memory"]))
+        try:
+            a = int(s.get("autosave") or 10)
+            self.save_min.set_selected(min(range(len(AUTOSAVE)), key=lambda i: abs(AUTOSAVE[i] - a)))
+        except ValueError:
+            pass
+        self.boot.set_active(s.get("autostart") == "yes")
+        if not self.version.get_text():
+            self.version.set_text(s.get("branch", ""))
+        self.net.set_selected(1 if s.get("network") == "portforward" else 0)
+        self.about_row.set_subtitle(f"Version {s.get('app_version', '?')} · github.com/rohansinghwow/zomboid-host")
+        self._busy = False
+
+    def _changed(self, key, value, title):
+        if self._busy:
+            return
+        cur = {"memory": "memory", "autosave": "autosave", "autostart": "autostart", "network": "network"}[key]
+        if self.app.status.get(cur) == value:
+            return
+        msg = ("The server restarts to use it." if self.app.status.get("running") == "yes"
+               and key in ("memory", "autosave") else "")
+        self.app.with_permission(lambda: self.app.run_task(f"{title}: {value}", ["set", key, value],
+                                                           on_done=lambda *_: self.app.refresh_status()))
+        if msg:
+            self.app.win.toast(msg)
+
+    def set_join_pw(self):
+        pw = self.join_pw.get_text()
+        if not PW_RE.match(pw):
+            self.app.win.toast("Password: 4–32 letters, numbers, - or _")
+            return
+        self.join_pw.set_text("")
+        self.app.confirm("Change the join password?",
+                         "Friends must type the new password. The server restarts if it is running.", "Change",
+                         lambda: self.app.run_task("Changing join password", ["set", "join-password"],
+                                                   {"PZHOST_VALUE": pw}))
+
+    def set_version(self):
+        v = self.version.get_text().strip()
+        if not v or v == self.app.status.get("branch"):
+            return
+        self.app.confirm(f"Switch the server to version {v}?",
+                         "All friends must switch their game to the same version. This downloads the server "
+                         "files again.", "Switch",
+                         lambda: self.app.run_task(f"Switching to {v}", ["set", "version", v]))
+
+    def show_log(self):
+        def done(rc, out):
+            dlg = Adw.Dialog(title="Server log", content_width=860, content_height=600)
+            tv = Adw.ToolbarView()
+            tv.add_top_bar(Adw.HeaderBar())
+            view = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                                left_margin=8, right_margin=8, top_margin=8)
+            view.get_buffer().set_text(ANSI.sub("", out) or "(empty)")
+            sw = Gtk.ScrolledWindow(child=view, vexpand=True)
+            tv.set_content(sw)
+            dlg.set_child(tv)
+            dlg.present(self.app.win)
+            GLib.idle_add(lambda: (sw.get_vadjustment().set_value(sw.get_vadjustment().get_upper()), False)[1])
+        self.app.with_sudo(lambda: self.app.query(["gui-log", "400"], done))
+
+    def uninstall(self):
+        dlg = Adw.AlertDialog(heading="Uninstall the server?",
+                              body="Removes the services, power, battery, Wi-Fi and firewall changes. "
+                                   "Your world is kept unless you tick the box.")
+        chk = Gtk.CheckButton(label="Also DELETE the server files and the world (a copy is saved to your home folder)")
+        dlg.set_extra_child(chk)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("go", "Uninstall")
+        dlg.set_response_appearance("go", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r == "go":
+                args = ["uninstall", "--yes"] + (["--delete-world"] if chk.get_active() else [])
+                self.app.with_sudo(lambda: self.app.run_task("Uninstalling", args))
+        dlg.connect("response", resp)
+        dlg.present(self.app.win)
+
+
+# =============================================================================
+#  Application
+# =============================================================================
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.pw = None
+        self.status = {}
+        self.win = None
+        self._status_running = False
+        self._grant = False
+
+    def do_activate(self):
+        if self.win:
+            self.win.present()
+            return
+        self.win = Window(self)
+        self.win.present()
+        self.refresh_status()
+        GLib.timeout_add_seconds(5, self._tick)
+        self.query(["update-check"], lambda rc, out: self.win.banner.set_revealed(
+            parse_kv(out).get("update") == "yes"))
+
+    # ---- environment / processes
+    def env(self, extra=None):
+        e = dict(os.environ)
+        e["PZHOST_GUI"] = "1"
+        e["SUDO_ASKPASS"] = ASKPASS   # prints PZHOST_SUDO_PW for sudo -A
+        if self.pw:
+            e["PZHOST_SUDO_PW"] = self.pw
+        if self._grant:
+            e["PZHOST_GRANT"] = "yes"   # user pressed Allow on the permission dialog
+        e.update(extra or {})
+        return e
+
+    def query(self, args, cb, extra_env=None, timeout=180):
+        """Run pzhost in the background; cb(rc, output) on the main thread."""
+        def work():
+            try:
+                p = subprocess.run([PZHOST, *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                   env=self.env(extra_env), timeout=timeout, errors="replace")
+                rc, out = p.returncode, p.stdout + p.stderr
+            except (OSError, subprocess.TimeoutExpired) as e:
+                rc, out = 1, str(e)
+            GLib.idle_add(lambda: (cb(rc, out), False)[1])
+        threading.Thread(target=work, daemon=True).start()
+
+    def run_task(self, title, args, extra_env=None, on_done=None):
+        def go():
+            TaskDialog(self, title, args, extra_env, on_done).start(self.win)
+        self.with_sudo(go)
+
+    # ---- status polling
+    def _tick(self):
+        self.refresh_status()
+        return True
+
+    def refresh_status(self):
+        if self._status_running:
+            return
+        self._status_running = True
+
+        def done(rc, out):
+            self._status_running = False
+            if rc != 0 and not out:
+                return
+            s = parse_kv(out)
+            if not s:
+                return
+            self.status = s
+            installed = s.get("installed") == "yes"
+            self.win.set_installed(installed)
+            self.win.home.update(s)
+            self.win.laptop.update(s)
+            self.win.more.update(s)
+        self.query(["gui-status"], done, timeout=30)
+
+    # ---- password + permission
+    def with_sudo(self, cb):
+        if self.pw is not None:
+            cb()
+            return
+        dlg = Adw.AlertDialog(heading="Laptop password",
+                              body="Managing the server needs your laptop login password (the one you use for sudo). "
+                                   "It is only kept while this window is open.")
+        entry = Gtk.PasswordEntry(show_peek_icon=True)
+        state = {"checking": False}
+        err = Gtk.Label(css_classes=["error"], visible=False, wrap=True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.append(entry)
+        box.append(err)
+        dlg.set_extra_child(box)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("ok", "Unlock")
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("ok")
+        dlg.set_close_response("cancel")
+
+        def check(pw):
+            try:
+                p = subprocess.run(["sudo", "-S", "-k", "-p", "", "-v"], input=pw + "\n", capture_output=True,
+                                   text=True, timeout=20)
+                ok, msg = p.returncode == 0, p.stderr.strip()
+            except (OSError, subprocess.TimeoutExpired) as e:
+                ok, msg = False, str(e)
+            GLib.idle_add(lambda: (checked(pw, ok, msg), False)[1])
+
+        def checked(pw, ok, msg):
+            state["checking"] = False
+            if ok:
+                self.pw = pw
+                dlg.force_close()
+                cb()
+                return
+            if "sudoers" in msg or "not allowed" in msg:
+                err.set_label("Your user can't use sudo yet. In a terminal run:  su -   then:  "
+                              f"usermod -aG sudo {os.environ.get('USER', 'youruser')}   then log out and back in.")
+            else:
+                err.set_label("Wrong password — try again")
+            err.set_visible(True)
+            entry.set_text("")
+            entry.grab_focus()
+
+        def resp(_d, r):
+            if r == "ok" and not state["checking"]:
+                state["checking"] = True
+                err.set_label("Checking…")
+                err.set_visible(True)
+                threading.Thread(target=check, args=(entry.get_text(),), daemon=True).start()
+
+        # Keep the dialog open while the password is checked; Cancel / Esc close it.
+        dlg.connect("response", resp)
+        dlg.set_can_close(False)
+        dlg.connect("close-attempt", lambda *_: None if state["checking"] else dlg.force_close())
+        entry.connect("activate", lambda *_: resp(dlg, "ok"))
+        dlg.present(self.win)
+        GLib.idle_add(lambda: (entry.grab_focus(), False)[1])
+
+    def with_permission(self, cb):
+        if self.status.get("permission") == "yes":
+            self.with_sudo(cb)
+            return
+
+        def show(rc, text):
+            dlg = Adw.AlertDialog(heading="Permission needed",
+                                  body="To host the server, the app makes these changes to this laptop:")
+            view = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                                left_margin=6, right_margin=6)
+            body = "\n".join(l for l in ANSI.sub("", text).splitlines() if "═" not in l and "Permission needed" not in l)
+            view.get_buffer().set_text(body.strip())
+            sw = Gtk.ScrolledWindow(child=view, min_content_height=320, min_content_width=560)
+            dlg.set_extra_child(sw)
+            dlg.add_response("cancel", "Cancel")
+            dlg.add_response("ok", "Allow")
+            dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+            dlg.set_close_response("cancel")
+
+            def resp(_d, r):
+                if r == "ok":
+                    self.status["permission"] = "yes"
+                    self._grant = True
+                    self.with_sudo(cb)
+            dlg.connect("response", resp)
+            dlg.present(self.win)
+        self.query(["permission-text"], show)
+
+    # ---- helpers
+    def confirm(self, heading, body, action, cb, destructive=False):
+        dlg = Adw.AlertDialog(heading=heading, body=body)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("ok", action)
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE if destructive
+                                    else Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: cb() if r == "ok" else None)
+        dlg.present(self.win)
+
+    def copy(self, text):
+        Gdk.Display.get_default().get_clipboard().set_content(Gdk.ContentProvider.new_for_value(text))
+
+    def open_url(self, url):
+        Gtk.UriLauncher.new(url).launch(self.win, None, None, None)
+
+    def send_report(self):
+        dlg = Adw.AlertDialog(heading="Send an error report",
+                              body="The logs are sent as a PUBLIC GitHub issue. Passwords, emails and your public IP "
+                                   "are removed automatically.")
+        entry = Gtk.Entry(placeholder_text="What were you doing / what went wrong?")
+        dlg.set_extra_child(entry)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("ok", "Send")
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: r == "ok" and self.run_task(
+            "Sending error report", ["report"], {"PZHOST_REPORT_DESC": entry.get_text() or "(sent from the app)"}))
+        dlg.present(self.win)
+
+    def update_app(self):
+        def done(rc, out):
+            if rc == 0:
+                self.win.banner.set_revealed(False)
+                self.confirm("App updated", "Restart the app to use the new version?", "Restart",
+                             lambda: os.execv(sys.executable, [sys.executable, "/usr/local/bin/pzhost-gui"]))
+        self.run_task("Updating the app", ["self-update"], on_done=done)
+
+
+if __name__ == "__main__":
+    sys.exit(App().run([sys.argv[0]]))

@@ -16,6 +16,8 @@ if [[ $EUID -eq 0 ]]; then
   exit 1
 fi
 export PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
+# Started from the window app ("Update this app"): no terminal, the password comes from the app.
+if [[ ! -t 0 && -n ${SUDO_ASKPASS:-} ]]; then sudo() { command sudo -A "$@"; }; fi
 if command -v apt-get >/dev/null; then PKG=apt
 elif command -v pacman >/dev/null; then PKG=pacman
 else echo "This app is for Debian / Ubuntu / Arch Linux (apt or pacman not found)." >&2; exit 1; fi
@@ -36,6 +38,21 @@ fi
 
 echo "Installing Zomboid Host… (your password is needed to copy the app into /usr/local/bin)"
 sudo install -Dm755 "$SRC/pzhost" /usr/local/bin/pzhost
+sudo install -Dm755 "$SRC/pzhost-gui" /usr/local/bin/pzhost-gui
+sudo install -Dm755 "$SRC/pzhost-askpass" /usr/local/bin/pzhost-askpass
+
+# Window app: GTK4 + libadwaita for Python (Debian 13 has them in the normal repos).
+gui_ok() { python3 -c 'import gi; gi.require_version("Gtk","4.0"); gi.require_version("Adw","1"); from gi.repository import Gtk, Adw' >/dev/null 2>&1; }
+if ! gui_ok; then
+  echo "Installing the window app parts (GTK4 / libadwaita)…"
+  if [[ $PKG == apt ]]; then
+    sudo apt-get update && sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 \
+      || echo "Warning: could not install the window app parts — the terminal version (pzhost) still works."
+  else
+    sudo pacman -S --needed --noconfirm python-gobject gtk4 libadwaita \
+      || echo "Warning: could not install the window app parts — the terminal version (pzhost) still works."
+  fi
+fi
 
 # Needed for error reports and app updates.
 if [[ $PKG == apt ]]; then
@@ -61,6 +78,7 @@ echo "$SRC" >"$CONF_DIR/source_dir"
 # App menu entry + icon + desktop shortcut
 install -Dm644 "$SRC/assets/pzhost.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/pzhost.svg"
 install -Dm644 "$SRC/assets/pzhost.desktop" "$HOME/.local/share/applications/pzhost.desktop"
+install -Dm644 "$SRC/assets/pzhost-terminal.desktop" "$HOME/.local/share/applications/pzhost-terminal.desktop"
 DESKTOP_DIR="$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")"
 if [[ -d $DESKTOP_DIR ]]; then
   install -Dm755 "$SRC/assets/pzhost.desktop" "$DESKTOP_DIR/pzhost.desktop"
@@ -70,9 +88,15 @@ update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
 echo
 echo "✔ Installed: pzhost $(/usr/local/bin/pzhost version | awk '{print $2}')"
-echo "  Open it from the app menu (\"Zomboid Host\"), the desktop icon, or type: pzhost"
+echo "  Open it from the app menu (\"Zomboid Host\") or the desktop icon."
+echo "  Terminal version: type pzhost"
 echo
 
 [[ ${1:-} == --no-launch ]] && exit 0
 exec 1>&3 2>&4
+if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] && gui_ok; then
+  setsid -f /usr/local/bin/pzhost-gui >/dev/null 2>&1 < /dev/null
+  echo "The Zomboid Host window is opening…"
+  exit 0
+fi
 exec /usr/local/bin/pzhost

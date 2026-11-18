@@ -1,0 +1,5 @@
+#!/bin/sh
+# sudo password helper for the Zomboid Host window app (SUDO_ASKPASS).
+# The app passes the password it checked in its own dialog via the environment
+# of the pzhost process only; nothing is written to disk.
+printf '%s\n' "${PZHOST_SUDO_PW:-}"

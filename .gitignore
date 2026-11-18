@@ -2,3 +2,4 @@
 report-*.md
 ZOMBOID_JOIN_INFO.txt
 .DS_Store
+__pycache__/

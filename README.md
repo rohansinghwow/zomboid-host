@@ -31,20 +31,28 @@ cd ~/zomboid-host
 
 ### 2. Set up
 
-The app opens automatically. Choose **1) Set up the server**:
+The **Zomboid Host** window opens by itself (later: app menu or desktop icon).
 
-1. Read the permission screen, type `yes`
-2. Enter your password once
-3. Answer a few questions (game version, RAM, passwords, Tailscale or port forwarding)
-4. Wait — the first download and world creation take 10–30 minutes
-5. The **join info for friends** appears at the end (also saved in `~/ZOMBOID_JOIN_INFO.txt`)
+1. Fill in the **Set up** page: game version, join password, admin password, Tailscale or port forwarding
+2. Press **Set up the server**, read the permission list, press **Allow**, type your laptop password
+3. Wait — the first download and world creation take 10–30 minutes (the window shows the progress;
+   for Tailscale your browser opens to log in)
+4. The **Server** tab then shows the **join info for friends** with copy buttons
 
-Next time, open **Zomboid Host** from the app menu / desktop icon, or type `pzhost`.
+### 3. Using the app
 
-### 3. Every game session
-
-| Want to… | Menu option |
+| Tab | What's there |
 |---|---|
+| **Server** | Start / Stop / Restart · join info (IP, port, password) with copy buttons · players online · message everyone |
+| **Gameplay** | **Beginner** / Normal / Hard presets · zombies, speed, infection, XP, loot, day length, water/power… |
+| **World** | Save now · backup now · restore a backup · **Start a new world** |
+| **Laptop** | **Make this laptop a server**: battery stops at 80%, no sleep, Wi-Fi never sleeps + reconnects by itself, server starts on boot |
+| **More** | Join password, memory, auto-save, game version · ping check · server log · **Send error report** · **Update this app** · repair · uninstall |
+
+Prefer the terminal? **Zomboid Host (terminal)** in the app menu, or type `pzhost` — same features as a numbered menu
+(19 gameplay, 20 new world, 21 laptop server mode, 14 error report, 15 update).
+
+---|---|
 | Start / stop the server | 1 / 2 |
 | Show what friends type in game | **4) Join info for friends** |
 | See who's online | 5 |
@@ -82,7 +90,9 @@ The host sends you the join info. In short:
 | `pzbackup.timer` (05:00), `pzrestart.timer` (05:10) | daily backup (7 days kept), daily restart | uninstall |
 | Lid-close ignored, sleep targets masked | laptop keeps hosting | uninstall |
 | `pzbattery.service`: charging stops at 80% (if the laptop supports it from Linux, otherwise BIOS help is shown) | battery lasts years plugged in 24/7 | uninstall (back to 100%) |
-| Current Wi-Fi connection: password stored system-wide, auto-connect, unlimited retries | Wi-Fi works after reboot without login | NetworkManager settings |
+| Current Wi-Fi connection: password stored system-wide, auto-connect, unlimited retries, power saving off | Wi-Fi works after reboot without login and never dozes off | NetworkManager settings |
+| `/etc/modprobe.d/pzhost-wifi.conf` (Intel / Realtek / MediaTek Wi-Fi chip power saving off) | no random Wi-Fi drop-outs | uninstall |
+| `pzwifi-watchdog.timer`: every minute; if router + internet don't answer 3× in a row, reconnects Wi-Fi (then restarts NetworkManager) | Wi-Fi recovers by itself | uninstall |
 | UDP 16261-16262 (+41641 Tailscale) in ufw/firewalld | friends can connect | uninstall |
 | `/etc/sysctl.d/90-pzhost.conf`, Wi-Fi power-save off, server `Nice=-5`, performance profile while running | lower, steadier ping | uninstall |
 | `servertest.ini`: private, password, auto-save every 10 min, built-in backups | safety | settings |

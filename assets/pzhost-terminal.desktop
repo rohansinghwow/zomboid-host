@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Zomboid Host (terminal)
+GenericName=Project Zomboid Server
+Comment=Terminal menu version of Zomboid Host
+Exec=/usr/local/bin/pzhost
+Icon=pzhost
+Terminal=true
+Categories=Game;Network;
+Keywords=zomboid;server;pz;terminal;
