@@ -8,7 +8,7 @@
 #          pzhost help       (list all commands)
 # =============================================================================
 
-PZHOST_VERSION="1.7.1"
+PZHOST_VERSION="1.7.2"
 REPO="rohansinghwow/zomboid-host"
 
 # ---- fixed paths -------------------------------------------------------------
@@ -187,6 +187,7 @@ trap cleanup EXIT
 
 fix_lib_perms() {  # heal installs made by v1.0–1.6 (scripts folder was root-only → backups failed)
   [[ -d $LIB_DIR ]] || return 0
+  [[ -f ${STATE_DIR}/.perms-ok-1 ]] && return 0   # only needs to run once — keeps every click fast
   if [[ $(stat -c %a "$LIB_DIR" 2>/dev/null) != 755 ]] || ! sudo -u "$PZ_USER" test -x "${LIB_DIR}/pz-backup.sh" 2>/dev/null; then
     sudo chmod 755 "$LIB_DIR" && sudo find "$LIB_DIR" -maxdepth 1 -name '*.sh' -exec chmod 755 {} + \
       && log INFO "fixed permissions of $LIB_DIR"
@@ -195,6 +196,7 @@ fix_lib_perms() {  # heal installs made by v1.0–1.6 (scripts folder was root-o
   for f in /usr/share/keyrings/tailscale-archive-keyring.gpg /etc/apt/sources.list.d/tailscale.list; do
     [[ -f $f && $(stat -c %a "$f" 2>/dev/null) != 644 ]] && sudo chmod 644 "$f"   # apt reads these as user _apt
   done
+  touch "${STATE_DIR}/.perms-ok-1"
   return 0
 }
 
@@ -1354,29 +1356,41 @@ cmd_say() {
   send_console "servermsg \"${m}\"" && ok "Message sent."
 }
 
-cmd_console() {  # pzhost console "cmd" ["cmd2" …] — run server console commands, print the server's answer
-  require_installed || return 1; sudo_start || return 1
+# console_run "cmd"… — send all commands in ONE write, then return as soon as the
+# server has answered (max ~3 s) instead of sleeping a fixed time.
+console_run() {
   server_active || { err "The server is not running — start it first."; return 1; }
-  local ts c n=0; ts=$(date +%s)
+  local c lines=() cur out prev="" i
   for c in "$@"; do
     c=${c//$'\n'/ }; c=${c//$'\r'/}; c=${c#/}   # one line each; the console wants no leading "/"
-    [[ -n ${c// /} ]] || continue
-    send_console "$c" || return 1
-    n=$((n + 1)); sleep 0.3
+    [[ -n ${c// /} ]] && lines+=("$c")
   done
-  (( n )) || { err "No command given."; return 1; }
-  sleep 2
+  (( ${#lines[@]} )) || { err "No command given."; return 1; }
+  # bookmark the end of the server log, so only the answer to these commands is shown
+  cur=$(sudo journalctl -q -u pzserver.service -n 1 --show-cursor -o cat --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p')
+  printf '%s\n' "${lines[@]}" | sudo tee "$CONTROL" >/dev/null || return 1
+  log INFO "console ← ${lines[*]}"
+  for i in $(seq 1 15); do
+    sleep 0.2
+    out=$(sudo journalctl -q -u pzserver.service ${cur:+--after-cursor="$cur"} -o cat --no-pager 2>/dev/null | grep -v '^$')
+    # done when every command got a line back, or the answer stopped growing
+    [[ -n $out ]] && { (( $(wc -l <<<"$out") >= ${#lines[@]} )) || [[ $out == "$prev" ]]; } && break
+    prev=$out
+  done
+  [[ -n $out ]] && printf '%s\n' "$out" | tail -n 80
+  return 0
+}
+
+cmd_console() {  # pzhost console "cmd" ["cmd2" …] — run server console commands, print the server's answer
+  require_installed || return 1; sudo_start || return 1
   echo "── server answer ──"
-  sudo journalctl -q -u pzserver.service --since "@${ts}" -o cat --no-pager | grep -v '^$' | tail -n 80
+  console_run "$@"
 }
 
 cmd_players() {
   sudo_start || return 1
-  local ts; ts=$(date +%s)
-  send_console players || return 1
-  sleep 2
   echo "${W}Players online:${N}"
-  sudo journalctl -q -u pzserver.service --since "@${ts}" -o cat --no-pager | sed 's/^/  /'
+  console_run players | sed 's/^/  /'
 }
 
 cmd_logs() {
