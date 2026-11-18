@@ -8,7 +8,7 @@
 #          pzhost help       (list all commands)
 # =============================================================================
 
-PZHOST_VERSION="1.0.0"
+PZHOST_VERSION="1.0.1"
 REPO="rohansinghwow/zomboid-host"
 
 # ---- fixed paths -------------------------------------------------------------
@@ -1057,6 +1057,8 @@ redact() {  # redact FILE
     -e 's/(Password=).*/\1[REDACTED]/' \
     -e 's/(-adminpassword )[^ "]+/\1[REDACTED]/g' \
     -e 's/(gh[opsu]_)[A-Za-z0-9]+/\1[REDACTED]/g' \
+    -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[EMAIL]/g' \
+    -e 's/tskey-[A-Za-z0-9-]+/[REDACTED]/g' \
     -e 's/(PASSWORD=).*/\1[REDACTED]/' "$f"
 }
 
@@ -1081,7 +1083,8 @@ section() {  # section "Title" cmd... — fenced output block for the report
 cmd_report() {
   sudo -n true 2>/dev/null || sudo_start || true
   local desc f title
-  echo; echo "${W}Error report${N} — passwords and your public IP are removed automatically."
+  echo; echo "${W}Error report${N} — passwords, emails and your public IP are removed automatically."
+  echo "${D}Note: reports are PUBLIC GitHub issues — don't type private info in the description.${N}"
   desc=$(ask "In a few words: what were you doing / what went wrong?" "")
   PUBLIC_IP_CACHE=$(public_ip)
   f="${STATE_DIR}/report-$(date +%F_%H%M%S).md"

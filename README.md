@@ -17,15 +17,14 @@ If anything fails it can send a detailed, password-free error report to GitHub s
 Open a terminal (Konsole) and run:
 
 ```bash
-sudo pacman -S --needed git github-cli
-gh auth login                      # choose GitHub.com → HTTPS → Login with a web browser
-gh repo clone rohansinghwow/zomboid-host ~/zomboid-host
+sudo pacman -S --needed git
+git clone https://github.com/rohansinghwow/zomboid-host.git ~/zomboid-host
 cd ~/zomboid-host
 ./install.sh
 ```
 
-> The repo is private: the owner must first add you as a collaborator
-> (GitHub → repo → Settings → Collaborators → Add people).
+> To send error reports you need a free GitHub account; the app asks you to log in
+> (`gh auth login`) the first time you send one.
 
 ### 2. Set up
 
@@ -90,7 +89,7 @@ explicitly say so, and a copy is saved to your home folder first.
 - Server log: `journalctl -u pzserver` (or menu **10**)
 - Error report: menu **14** builds a report (system info, config, service status, firewall, ping check,
   app log, server log, console.txt, backups), **removes passwords, tokens and your public IP**,
-  and opens a GitHub issue labelled `error-report`. Without GitHub login it saves the file and tells you
+  and opens a **public** GitHub issue labelled `error-report` (emails are removed too). Without GitHub login it saves the file and tells you
   where to upload it.
 
 ## Command line
